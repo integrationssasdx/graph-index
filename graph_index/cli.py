@@ -9,6 +9,7 @@ import sys
 from .errors import PlanError
 from .planner import Planner
 from .schema import load_schema
+from .subscription import SubscriptionCompiler, push_events
 
 
 def _read_text_file(path: str) -> str:
@@ -23,27 +24,43 @@ def _read_text_file(path: str) -> str:
         raise PlanError("IoError", f"'{path}' is not valid UTF-8")
 
 
+def _load_variables(variables_text: str, source: str) -> dict:
+    try:
+        variables = json.loads(variables_text)
+    except json.JSONDecodeError as exc:
+        raise PlanError(
+            "ParseError",
+            f"{source}:{exc.lineno}:{exc.colno}: invalid JSON: {exc.msg}",
+        )
+    if not isinstance(variables, dict):
+        raise PlanError("VariablesError", f"'{source}' must contain a JSON object")
+    return variables
+
+
 def _cmd_query_plan(args) -> dict:
     schema_text = _read_text_file(args.schema)
     query_text = _read_text_file(args.query)
     variables_text = _read_text_file(args.variables)
 
     schema = load_schema(schema_text, args.schema)
-
-    try:
-        variables = json.loads(variables_text)
-    except json.JSONDecodeError as exc:
-        raise PlanError(
-            "ParseError",
-            f"{args.variables}:{exc.lineno}:{exc.colno}: invalid JSON: {exc.msg}",
-        )
-    if not isinstance(variables, dict):
-        raise PlanError(
-            "VariablesError", f"'{args.variables}' must contain a JSON object"
-        )
+    variables = _load_variables(variables_text, args.variables)
 
     planner = Planner(schema, variables)
     return planner.plan(query_text, args.query, args.operation)
+
+
+def _cmd_subscription_push(args) -> list:
+    schema_text = _read_text_file(args.schema)
+    subscription_text = _read_text_file(args.subscription)
+    variables_text = _read_text_file(args.variables)
+    events_text = _read_text_file(args.events)
+
+    schema = load_schema(schema_text, args.schema)
+    variables = _load_variables(variables_text, args.variables)
+
+    compiler = SubscriptionCompiler(schema, variables)
+    plan = compiler.compile(subscription_text, args.subscription, args.operation)
+    return push_events(plan, events_text, args.events)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +80,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="operation name to select when the document has several",
     )
+    subscription_push = sub.add_parser(
+        "subscription-push",
+        help="push entity change events matching a GraphQL subscription as JSONL",
+    )
+    subscription_push.add_argument(
+        "--schema", required=True, help="GraphQL schema file (SDL)"
+    )
+    subscription_push.add_argument(
+        "--subscription", required=True, help="GraphQL subscription file"
+    )
+    subscription_push.add_argument(
+        "--variables", required=True, help="variables JSON file"
+    )
+    subscription_push.add_argument(
+        "--events", required=True, help="entity change events file (NDJSON)"
+    )
+    subscription_push.add_argument(
+        "--operation",
+        default=None,
+        help="operation name to select when the document has several",
+    )
     return parser
 
 
@@ -70,17 +108,20 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "query-plan":
-            plan = _cmd_query_plan(args)
-        else:  # pragma: no cover - argparse enforces the subcommand
-            raise PlanError("InvalidRequest", f"unknown command '{args.command}'")
+            result = _cmd_query_plan(args)
+            sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+            return 0
+        if args.command == "subscription-push":
+            for row in _cmd_subscription_push(args):
+                sys.stdout.write(json.dumps(row, ensure_ascii=False) + "\n")
+            return 0
+        raise PlanError("InvalidRequest", f"unknown command '{args.command}'")
     except PlanError as exc:
         sys.stderr.write(
             json.dumps({"code": exc.code, "message": exc.message}, ensure_ascii=False)
             + "\n"
         )
         return 2
-    sys.stdout.write(json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
-    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

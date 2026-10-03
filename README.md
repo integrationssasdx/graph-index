@@ -8,7 +8,8 @@
 
 ## 状态
 
-初始基线：只有本说明，尚无实现。
+- `graph-index query-plan`：将 GraphQL 查询编译为实体扫描/连接计划。
+- `graph-index subscription-push --schema <schema.graphql> --subscription <subscription.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：将订阅编译为实体等值过滤与叶字段投影，按序匹配 NDJSON 实体变更事件（INSERT/UPDATE/DELETE），成功时向 stdout 输出 JSONL（字段：`subscription`、`path`、`event`、`entity`、`data`），失败时向 stderr 输出 `{code, message}` 并以退出码 2 结束。
 
 ## 约定
 
