@@ -24,10 +24,10 @@ def named_of(type_ref: TypeRef) -> str:
 class Entity:
     __slots__ = ("type_name", "table", "key")
 
-    def __init__(self, type_name: str, table: str, key: str):
+    def __init__(self, type_name: str, table: str, key: List[str]):
         self.type_name = type_name
         self.table = table
-        self.key = key
+        self.key = key  # primary key field names, in declared order
 
 
 class FieldInfo:
@@ -38,7 +38,8 @@ class FieldInfo:
         self.type_ref = type_ref
         self.args = args  # Dict[str, InputValueDef]
         self.link_directives = link_directives
-        self.link: Optional[Tuple[str, str]] = None  # (local, target) once validated
+        # (local names, target names, declared_as_arrays) once validated
+        self.link: Optional[Tuple[List[str], List[str], bool]] = None
 
 
 class TypeInfo:
@@ -151,18 +152,44 @@ def load_schema(text: str, source: str = "<schema>") -> Schema:
     return schema
 
 
+def _normalize_field_list(value, what: str) -> Tuple[List[str], bool]:
+    """Normalize a string-or-string-array directive argument.
+
+    Returns (field names in declared order, declared_as_array). Anything
+    else (empty arrays, non-string elements, duplicates, other types) is a
+    MappingError.
+    """
+    if isinstance(value, str):
+        if not value:
+            raise _mapping_error(f"{what} requires a non-empty string")
+        return [value], False
+    if isinstance(value, list):
+        if not value:
+            raise _mapping_error(f"{what} must not be an empty array")
+        names: List[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item:
+                raise _mapping_error(f"{what} must contain only non-empty strings")
+            if item in names:
+                raise _mapping_error(f"{what} contains duplicate field '{item}'")
+            names.append(item)
+        return names, True
+    raise _mapping_error(f"{what} must be a string or an array of strings")
+
+
 def _build_entity(schema: Schema, info: TypeInfo, directive: Directive) -> Entity:
     table = directive.args.get("name")
-    key = directive.args.get("key")
     if not isinstance(table, str) or not table:
         raise _mapping_error(f"@entity on '{info.name}' requires a non-empty string 'name'")
-    if not isinstance(key, str) or not key:
-        raise _mapping_error(f"@entity on '{info.name}' requires a non-empty string 'key'")
-    key_field = info.fields.get(key)
-    if key_field is None:
-        raise _mapping_error(f"@entity key '{key}' is not a field of type '{info.name}'")
-    if named_of(key_field.type_ref) not in schema.scalars:
-        raise _mapping_error(f"@entity key '{key}' of type '{info.name}' must be a scalar")
+    key, _ = _normalize_field_list(
+        directive.args.get("key"), f"@entity 'key' of type '{info.name}'"
+    )
+    for name in key:
+        key_field = info.fields.get(name)
+        if key_field is None:
+            raise _mapping_error(f"@entity key '{name}' is not a field of type '{info.name}'")
+        if named_of(key_field.type_ref) not in schema.scalars:
+            raise _mapping_error(f"@entity key '{name}' of type '{info.name}' must be a scalar")
     return Entity(info.name, table, key)
 
 
@@ -195,27 +222,43 @@ def _validate_links(schema: Schema) -> None:
             if not directives:
                 continue
             directive = directives[0]
-            local = directive.args.get("local")
-            target = directive.args.get("target")
-            if not isinstance(local, str) or not local:
-                raise _mapping_error(f"@link on '{info.name}.{field.name}' requires a non-empty string 'local'")
-            if not isinstance(target, str) or not target:
-                raise _mapping_error(f"@link on '{info.name}.{field.name}' requires a non-empty string 'target'")
+            where = f"@link on '{info.name}.{field.name}'"
+            local, local_is_array = _normalize_field_list(
+                directive.args.get("local"), f"{where} argument 'local'"
+            )
+            target, target_is_array = _normalize_field_list(
+                directive.args.get("target"), f"{where} argument 'target'"
+            )
+            if local_is_array != target_is_array:
+                raise _mapping_error(
+                    f"{where} must use the same form (string or array) for 'local' and 'target'"
+                )
+            if len(local) != len(target):
+                raise _mapping_error(
+                    f"{where} has {len(local)} local field(s) but {len(target)} target field(s)"
+                )
             target_type = named_of(field.type_ref)
-            if target_type not in schema.types:
+            target_info = schema.types.get(target_type)
+            if target_info is None:
                 raise _mapping_error(
                     f"@link on '{info.name}.{field.name}' must point to an object type"
                 )
-            local_field = info.fields.get(local)
-            if local_field is None:
-                raise _mapping_error(
-                    f"@link local field '{local}' is not a field of type '{info.name}'"
-                )
-            if named_of(local_field.type_ref) not in schema.scalars:
-                raise _mapping_error(
-                    f"@link local field '{local}' of type '{info.name}' must be a scalar"
-                )
-            field.link = (local, target)
+            for name in local:
+                local_field = info.fields.get(name)
+                if local_field is None:
+                    raise _mapping_error(
+                        f"@link local field '{name}' is not a field of type '{info.name}'"
+                    )
+                if named_of(local_field.type_ref) not in schema.scalars:
+                    raise _mapping_error(
+                        f"@link local field '{name}' of type '{info.name}' must be a scalar"
+                    )
+            for name in target:
+                if name not in target_info.fields:
+                    raise _mapping_error(
+                        f"@link target field '{name}' is not a field of type '{target_type}'"
+                    )
+            field.link = (local, target, local_is_array)
 
 
 def _validate_entity_tables(schema: Schema) -> None:

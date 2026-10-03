@@ -34,6 +34,27 @@ type Team @entity(name: "teams", key: "id") {
 }
 """
 
+COMPOSITE_SCHEMA = """\
+type Query {
+  transfers(chain_id: Int, id: ID): [Transfer!]!
+}
+
+type Transfer @entity(name: "transfers", key: ["chain_id", "id"]) {
+  chain_id: Int!
+  id: ID!
+  amount: Float
+  token_chain: Int
+  token_id: ID
+  token: Token @link(local: ["token_chain", "token_id"], target: ["chain_id", "id"])
+}
+
+type Token @entity(name: "tokens", key: ["chain_id", "id"]) {
+  chain_id: Int!
+  id: ID!
+  symbol: String!
+}
+"""
+
 
 class CliCase(unittest.TestCase):
     def setUp(self):
@@ -336,6 +357,130 @@ class CliCase(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = main(argv)
         self.assert_error(code, stdout.getvalue(), stderr.getvalue(), "IoError")
+
+    # -- composite keys ---------------------------------------------------------
+
+    def test_composite_key_join(self):
+        query = "{ transfers { chain_id id token { symbol } } }"
+        plan = self.assert_plan(*self.run_cli(query, schema=COMPOSITE_SCHEMA))
+        root = plan["roots"][0]
+        self.assertEqual(root["entity"], "transfers")
+        self.assertEqual(
+            root["fields"],
+            ["transfers.chain_id", "transfers.id", "transfers.token.symbol"],
+        )
+        self.assertEqual(
+            plan["joins"],
+            [{"path": "transfers.token", "fromEntity": "transfers",
+              "fromField": ["token_chain", "token_id"],
+              "toEntity": "tokens",
+              "toField": ["chain_id", "id"]}],
+        )
+
+    def test_composite_key_single_element_array_form(self):
+        schema = """
+        type Query { users: [User!]! }
+        type User @entity(name: "users", key: ["id"]) {
+          id: ID!
+          team_id: ID
+          team: Team @link(local: ["team_id"], target: ["id"])
+        }
+        type Team @entity(name: "teams", key: ["id"]) { id: ID! }
+        """
+        plan = self.assert_plan(*self.run_cli("{ users { team { id } } }", schema=schema))
+        self.assertEqual(
+            plan["joins"],
+            [{"path": "users.team", "fromEntity": "users", "fromField": ["team_id"],
+              "toEntity": "teams", "toField": ["id"]}],
+        )
+
+    def test_composite_link_target_wrong_order(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'target: ["chain_id", "id"]', 'target: ["id", "chain_id"]'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "InvalidJoin")
+
+    def test_composite_link_target_not_full_key(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'target: ["chain_id", "id"]', 'target: ["chain_id", "symbol"]'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "InvalidJoin")
+
+    def test_single_link_into_composite_key_entity(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'local: ["token_chain", "token_id"], target: ["chain_id", "id"]',
+            'local: "token_id", target: "id"',
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "InvalidJoin")
+
+    def test_composite_key_empty_array(self):
+        schema = 'type Query { users: [User!]! }\ntype User @entity(name: "users", key: []) { id: ID! }\n'
+        self.assert_error(*self.run_cli("{ users { id } }", schema=schema), "MappingError")
+
+    def test_composite_key_duplicate_elements(self):
+        schema = 'type Query { users: [User!]! }\ntype User @entity(name: "users", key: ["id", "id"]) { id: ID! }\n'
+        self.assert_error(*self.run_cli("{ users { id } }", schema=schema), "MappingError")
+
+    def test_composite_key_missing_field(self):
+        schema = 'type Query { users: [User!]! }\ntype User @entity(name: "users", key: ["id", "nope"]) { id: ID! }\n'
+        self.assert_error(*self.run_cli("{ users { id } }", schema=schema), "MappingError")
+
+    def test_composite_key_non_scalar_field(self):
+        schema = """
+        type Query { users: [User!]! }
+        type User @entity(name: "users", key: ["id", "team"]) { id: ID! team: Team }
+        type Team @entity(name: "teams", key: "id") { id: ID! }
+        """
+        self.assert_error(*self.run_cli("{ users { id } }", schema=schema), "MappingError")
+
+    def test_composite_key_unsupported_form(self):
+        schema = 'type Query { users: [User!]! }\ntype User @entity(name: "users", key: 5) { id: ID! }\n'
+        self.assert_error(*self.run_cli("{ users { id } }", schema=schema), "MappingError")
+
+    def test_composite_link_local_empty_array(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'local: ["token_chain", "token_id"]', 'local: []'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "MappingError")
+
+    def test_composite_link_local_duplicate_elements(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'local: ["token_chain", "token_id"]', 'local: ["token_id", "token_id"]'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "MappingError")
+
+    def test_composite_link_count_mismatch(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'target: ["chain_id", "id"]', 'target: ["id"]'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "MappingError")
+
+    def test_composite_link_mixed_forms(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'local: ["token_chain", "token_id"]', 'local: "token_id"'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "MappingError")
+
+    def test_composite_link_target_field_missing(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'target: ["chain_id", "id"]', 'target: ["chain_id", "nope"]'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "MappingError")
+
+    def test_composite_link_local_non_scalar(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'local: ["token_chain", "token_id"]', 'local: ["token_chain", "token"]'
+        )
+        query = "{ transfers { token { symbol } } }"
+        self.assert_error(*self.run_cli(query, schema=schema), "MappingError")
 
 
 if __name__ == "__main__":

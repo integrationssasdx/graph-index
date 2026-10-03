@@ -63,6 +63,31 @@ EVENTS = "\n".join(
     ]
 ) + "\n"
 
+COMPOSITE_SCHEMA = """\
+type Query {
+  transfers: [Transfer!]!
+}
+
+type Subscription {
+  transfers(chain_id: Int, id: ID): [Transfer!]!
+}
+
+type Transfer @entity(name: "transfers", key: ["chain_id", "id"]) {
+  chain_id: Int!
+  id: ID!
+  amount: Float
+  token_chain: Int
+  token_id: ID
+  token: Token @link(local: ["token_chain", "token_id"], target: ["chain_id", "id"])
+}
+
+type Token @entity(name: "tokens", key: ["chain_id", "id"]) {
+  chain_id: Int!
+  id: ID!
+  symbol: String!
+}
+"""
+
 
 class CliCase(unittest.TestCase):
     def setUp(self):
@@ -371,6 +396,35 @@ class CliCase(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = main(argv)
         self.assert_error(code, stdout.getvalue(), stderr.getvalue(), "IoError")
+
+    # -- composite keys ---------------------------------------------------------
+
+    def test_composite_key_schema_pushes_events(self):
+        events = "\n".join(
+            json.dumps(row)
+            for row in [
+                {"op": "INSERT", "entity": "transfers", "before": None,
+                 "after": {"chain_id": 1, "id": "t1", "amount": 3.5}},
+                {"op": "INSERT", "entity": "transfers", "before": None,
+                 "after": {"chain_id": 2, "id": "t2", "amount": 1.0}},
+            ]
+        ) + "\n"
+        subscription = "subscription { transfers(chain_id: 1) { chain_id id } }"
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=COMPOSITE_SCHEMA, events=events)
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["entity"], "transfers")
+        self.assertEqual(rows[0]["data"], {"chain_id": 1, "id": "t1"})
+
+    def test_invalid_composite_mapping_produces_no_output(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'key: ["chain_id", "id"]', 'key: ["chain_id", "chain_id"]', 1
+        )
+        self.assert_error(
+            *self.run_cli("subscription { transfers { id } }", schema=schema),
+            "MappingError",
+        )
 
 
 if __name__ == "__main__":

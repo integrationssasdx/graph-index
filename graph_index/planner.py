@@ -327,19 +327,19 @@ class Planner:
                     "UnknownEntity",
                     f"type '{target.name}' is not mapped to an entity",
                 )
-            local, target_key = field.link
+            local, target_key, as_array = field.link
             if target_key != target_entity.key:
                 raise PlanError(
                     "InvalidJoin",
-                    f"@link target '{target_key}' is not the primary key of entity '{target_entity.table}'",
+                    f"@link target {target_key} does not match the primary key of entity '{target_entity.table}'",
                 )
             self.joins.append(
                 {
                     "path": node_path,
                     "fromEntity": entity.table,
-                    "fromField": local,
+                    "fromField": local if as_array else local[0],
                     "toEntity": target_entity.table,
-                    "toField": target_key,
+                    "toField": target_key if as_array else target_key[0],
                 }
             )
             self._walk(target, target_entity, node.selection_set, node_path, entry)
