@@ -41,6 +41,34 @@ type Team @entity(name: "teams", key: "id") {
 }
 """
 
+COMPOSITE_SCHEMA = """\
+type Query {
+  x: Int
+}
+
+type Subscription {
+  transfers(chain_id: ID, id: ID): [Transfer!]!
+}
+
+type Transfer @entity(name: "transfers", key: ["chain_id", "id"]) {
+  chain_id: ID!
+  id: ID!
+  amount: Int!
+}
+"""
+
+COMPOSITE_EVENTS = "\n".join(
+    [
+        json.dumps(row)
+        for row in [
+            {"op": "INSERT", "entity": "transfers", "before": None,
+             "after": {"chain_id": 1, "id": 7, "amount": 50}},
+            {"op": "INSERT", "entity": "transfers", "before": None,
+             "after": {"chain_id": 2, "id": 7, "amount": 90}},
+        ]
+    ]
+) + "\n"
+
 EVENTS = "\n".join(
     [
         json.dumps(row)
@@ -262,6 +290,72 @@ class CliCase(unittest.TestCase):
             *self.run_cli("subscription { version { tag } }", schema=schema),
             "MappingError",
         )
+
+    # -- composite keys ---------------------------------------------------------
+
+    def test_composite_key_entity_projects_leaves(self):
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { transfers { id amount } }",
+                schema=COMPOSITE_SCHEMA,
+                events=COMPOSITE_EVENTS,
+            )
+        )
+        self.assertEqual([r["entity"] for r in rows], ["transfers", "transfers"])
+        self.assertEqual(rows[0]["data"], {"id": 7, "amount": 50})
+        self.assertEqual(rows[1]["data"], {"id": 7, "amount": 90})
+
+    def test_composite_key_equality_filter_matches_tuple_components(self):
+        sub = "subscription { transfers(chain_id: 1, id: 7) { amount } }"
+        rows = self.assert_rows(
+            *self.run_cli(sub, schema=COMPOSITE_SCHEMA, events=COMPOSITE_EVENTS)
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["data"], {"amount": 50})
+
+    def test_composite_key_filter_with_variable(self):
+        sub = "subscription S($c: ID, $i: ID) { transfers(chain_id: $c, id: $i) { amount } }"
+        rows = self.assert_rows(
+            *self.run_cli(
+                sub, '{"c": 2, "i": 7}',
+                schema=COMPOSITE_SCHEMA, events=COMPOSITE_EVENTS,
+            )
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["data"], {"amount": 90})
+
+    def test_invalid_composite_mapping_blocks_all_push(self):
+        # Illegal mapping must abort at compile time: no rows and exit code 2.
+        schema = COMPOSITE_SCHEMA.replace(
+            'key: ["chain_id", "id"]', 'key: ["chain_id", "ghost"]'
+        )
+        code, stdout, stderr = self.run_cli(
+            "subscription { transfers { id } }",
+            schema=schema, events=COMPOSITE_EVENTS,
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["code"], "MappingError")
+
+    def test_composite_link_mapping_validated_in_subscription(self):
+        # subscription-push shares @link validation; nested link fields remain
+        # unsupported selections, but a malformed link must fail mapping first.
+        schema = COMPOSITE_SCHEMA + """
+        type Token @entity(name: "tokens", key: ["chain_id", "address"]) {
+          chain_id: ID!
+          address: ID!
+        }
+        extend type Transfer {
+          token: Token @link(local: ["nope"], target: ["chain_id", "address"])
+        }
+        """
+        code, stdout, stderr = self.run_cli(
+            "subscription { transfers { id } }",
+            schema=schema, events=COMPOSITE_EVENTS,
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["code"], "MappingError")
 
     # -- variables errors -------------------------------------------------------------
 

@@ -327,19 +327,27 @@ class Planner:
                     "UnknownEntity",
                     f"type '{target.name}' is not mapped to an entity",
                 )
-            local, target_key = field.link
-            if target_key != target_entity.key:
+            local_fields, target_fields, composite = field.link
+            if target_fields != target_entity.key:
                 raise PlanError(
                     "InvalidJoin",
-                    f"@link target '{target_key}' is not the primary key of entity '{target_entity.table}'",
+                    f"@link target {target_fields} is not the primary key of entity '{target_entity.table}'",
                 )
+            # Composite (list-form) links emit the field name arrays in
+            # declaration order; single-field links keep emitting strings.
+            if composite:
+                from_field: Any = local_fields
+                to_field: Any = target_fields
+            else:
+                from_field = local_fields[0]
+                to_field = target_fields[0]
             self.joins.append(
                 {
                     "path": node_path,
                     "fromEntity": entity.table,
-                    "fromField": local,
+                    "fromField": from_field,
                     "toEntity": target_entity.table,
-                    "toField": target_key,
+                    "toField": to_field,
                 }
             )
             self._walk(target, target_entity, node.selection_set, node_path, entry)

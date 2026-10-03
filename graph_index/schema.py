@@ -24,9 +24,10 @@ def named_of(type_ref: TypeRef) -> str:
 class Entity:
     __slots__ = ("type_name", "table", "key")
 
-    def __init__(self, type_name: str, table: str, key: str):
+    def __init__(self, type_name: str, table: str, key: List[str]):
         self.type_name = type_name
         self.table = table
+        # One or more scalar field names, in declaration order.
         self.key = key
 
 
@@ -38,7 +39,9 @@ class FieldInfo:
         self.type_ref = type_ref
         self.args = args  # Dict[str, InputValueDef]
         self.link_directives = link_directives
-        self.link: Optional[Tuple[str, str]] = None  # (local, target) once validated
+        # (local fields, target fields, composite) once validated; field order
+        # is the declaration order and 'composite' records the list form.
+        self.link: Optional[Tuple[List[str], List[str], bool]] = None
 
 
 class TypeInfo:
@@ -77,6 +80,38 @@ class Schema:
 
 def _mapping_error(message: str) -> PlanError:
     return PlanError("MappingError", message)
+
+
+def _normalize_field_list(value, what: str, where: str) -> Tuple[List[str], bool]:
+    """Normalize a scalar/list @entity/@link argument into (fields, composite).
+
+    Accepts a non-empty string or a non-empty list of distinct non-empty
+    strings; anything else (empty list, duplicates, non-string elements,
+    numbers, dicts, booleans ...) is a MappingError. 'composite' is True when
+    the argument was declared in list form.
+    """
+    if isinstance(value, str):
+        if not value:
+            raise _mapping_error(f"{what} on '{where}' must be a non-empty string")
+        return [value], False
+    if isinstance(value, list):
+        if not value:
+            raise _mapping_error(f"{what} on '{where}' must not be an empty list")
+        fields: List[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise _mapping_error(
+                    f"{what} on '{where}' must be a string or a list of strings"
+                )
+            if not item:
+                raise _mapping_error(f"{what} on '{where}' must contain non-empty strings")
+            if item in fields:
+                raise _mapping_error(f"{what} on '{where}' lists field '{item}' more than once")
+            fields.append(item)
+        return fields, True
+    raise _mapping_error(
+        f"{what} on '{where}' must be a string or a non-empty list of strings"
+    )
 
 
 def load_schema(text: str, source: str = "<schema>") -> Schema:
@@ -156,14 +191,18 @@ def _build_entity(schema: Schema, info: TypeInfo, directive: Directive) -> Entit
     key = directive.args.get("key")
     if not isinstance(table, str) or not table:
         raise _mapping_error(f"@entity on '{info.name}' requires a non-empty string 'name'")
-    if not isinstance(key, str) or not key:
-        raise _mapping_error(f"@entity on '{info.name}' requires a non-empty string 'key'")
-    key_field = info.fields.get(key)
-    if key_field is None:
-        raise _mapping_error(f"@entity key '{key}' is not a field of type '{info.name}'")
-    if named_of(key_field.type_ref) not in schema.scalars:
-        raise _mapping_error(f"@entity key '{key}' of type '{info.name}' must be a scalar")
-    return Entity(info.name, table, key)
+    key_fields, _ = _normalize_field_list(key, "@entity key", info.name)
+    for key_field_name in key_fields:
+        key_field = info.fields.get(key_field_name)
+        if key_field is None:
+            raise _mapping_error(
+                f"@entity key '{key_field_name}' is not a field of type '{info.name}'"
+            )
+        if named_of(key_field.type_ref) not in schema.scalars:
+            raise _mapping_error(
+                f"@entity key '{key_field_name}' of type '{info.name}' must be a scalar"
+            )
+    return Entity(info.name, table, key_fields)
 
 
 def _validate_type_references(schema: Schema) -> None:
@@ -195,27 +234,46 @@ def _validate_links(schema: Schema) -> None:
             if not directives:
                 continue
             directive = directives[0]
-            local = directive.args.get("local")
-            target = directive.args.get("target")
-            if not isinstance(local, str) or not local:
-                raise _mapping_error(f"@link on '{info.name}.{field.name}' requires a non-empty string 'local'")
-            if not isinstance(target, str) or not target:
-                raise _mapping_error(f"@link on '{info.name}.{field.name}' requires a non-empty string 'target'")
-            target_type = named_of(field.type_ref)
-            if target_type not in schema.types:
+            where = f"{info.name}.{field.name}"
+            local_fields, local_composite = _normalize_field_list(
+                directive.args.get("local"), "@link local", where
+            )
+            target_fields, target_composite = _normalize_field_list(
+                directive.args.get("target"), "@link target", where
+            )
+            if local_composite != target_composite:
                 raise _mapping_error(
-                    f"@link on '{info.name}.{field.name}' must point to an object type"
+                    f"@link on '{where}' must declare 'local' and 'target' in the same "
+                    f"form (both strings or both lists)"
                 )
-            local_field = info.fields.get(local)
-            if local_field is None:
+            if len(local_fields) != len(target_fields):
                 raise _mapping_error(
-                    f"@link local field '{local}' is not a field of type '{info.name}'"
+                    f"@link on '{where}' has {len(local_fields)} local field(s) but "
+                    f"{len(target_fields)} target field(s)"
                 )
-            if named_of(local_field.type_ref) not in schema.scalars:
+            target_type_name = named_of(field.type_ref)
+            target_type = schema.types.get(target_type_name)
+            if target_type is None:
                 raise _mapping_error(
-                    f"@link local field '{local}' of type '{info.name}' must be a scalar"
+                    f"@link on '{where}' must point to an object type"
                 )
-            field.link = (local, target)
+            for local in local_fields:
+                local_field = info.fields.get(local)
+                if local_field is None:
+                    raise _mapping_error(
+                        f"@link local field '{local}' is not a field of type '{info.name}'"
+                    )
+                if named_of(local_field.type_ref) not in schema.scalars:
+                    raise _mapping_error(
+                        f"@link local field '{local}' of type '{info.name}' must be a scalar"
+                    )
+            for target in target_fields:
+                if target not in target_type.fields:
+                    raise _mapping_error(
+                        f"@link target field '{target}' is not a field of type "
+                        f"'{target_type.name}'"
+                    )
+            field.link = (local_fields, target_fields, local_composite)
 
 
 def _validate_entity_tables(schema: Schema) -> None:
