@@ -8,7 +8,8 @@
 
 ## 状态
 
-初始基线：只有本说明，尚无实现。
+- `graph-index query-plan`：把 GraphQL 查询编译为实体扫描/连接计划。
+- `graph-index subscription-push`：按订阅过滤 events.ndjson 实体变更，stdout 输出 JSONL 通知。
 
 ## 约定
 
