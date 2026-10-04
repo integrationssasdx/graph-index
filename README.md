@@ -9,7 +9,7 @@
 ## 状态
 
 - `graph-index query-plan`：将 GraphQL 查询编译为实体扫描/连接计划。
-- `graph-index subscription-push --schema <schema.graphql> --subscription <subscription.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：将订阅编译为实体等值过滤与叶字段投影，按序匹配 NDJSON 实体变更事件（INSERT/UPDATE/DELETE），成功时向 stdout 输出 JSONL（字段：`subscription`、`path`、`event`、`entity`、`data`），失败时向 stderr 输出 `{code, message}` 并以退出码 2 结束。
+- `graph-index subscription-push --schema <schema.graphql> --subscription <subscription.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：将订阅编译为实体等值过滤与字段投影（支持叶字段以及经 @link 到达的一层或多层嵌套对象字段，含别名与片段展开），按序匹配 NDJSON 实体变更事件（INSERT/UPDATE/DELETE）。处理时先逐行解析校验，再按实体主键维护各实体最新快照（INSERT/UPDATE 保存 after，DELETE 删除 before 对应实体）；嵌套字段按 @link 的 local→target 顺序从截至当前行的最新目标快照构造对象，任一 local 为 null 时关系为 null（非空对象字段则以 EventError 结束），列表关系以 UnsupportedSelection 结束。成功时向 stdout 输出 JSONL（字段：`subscription`、`path`、`event`、`entity`、`data`），失败时向 stderr 输出 `{code, message}` 并以退出码 2 结束。
 
 ## 约定
 
