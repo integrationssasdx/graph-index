@@ -1,29 +1,82 @@
 """Subscription push: match entity change events against a subscription.
 
-Compiles a subscription operation into an equality filter plus a leaf-field
-projection over a single @entity root, then applies it to an NDJSON stream of
-entity change events. GraphQL, variable and @entity mapping semantics are
-shared with the query planner; only the supported selection shape is narrower
-(root entity scalar/enum leaf fields only).
+Compiles a subscription operation into an equality filter plus a nested
+@link-backed projection tree over a single @entity root, then applies it to an
+NDJSON stream of entity change events. GraphQL, variable and @entity mapping
+semantics are shared with the query planner; root arguments form equality
+filters on the subscription's root entity, while object fields declared with
+@link resolve against the freshest target snapshots seen so far in the stream.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .errors import PlanError
 from .gql import parse_executable
 from .planner import Planner
-from .schema import named_of
+from .schema import Entity, TypeInfo, named_of
 
 EVENT_OPS = ("INSERT", "UPDATE", "DELETE")
+
+
+class _Leaf:
+    """A selected scalar/enum leaf field."""
+
+    __slots__ = ("response_key", "field_name")
+
+    def __init__(self, response_key: str, field_name: str):
+        self.response_key = response_key
+        self.field_name = field_name
+
+
+class _Link:
+    """A validated single-object @link at an object field in the selection."""
+
+    __slots__ = (
+        "response_key",
+        "field_name",
+        "local",
+        "target",
+        "as_array",
+        "non_null",
+        "target_table",
+        "children",
+    )
+
+    def __init__(
+        self,
+        response_key: str,
+        field_name: str,
+        local: List[str],
+        target: List[str],
+        as_array: bool,
+        non_null: bool,
+        target_table: str,
+        children: List[Any],
+    ):
+        self.response_key = response_key
+        self.field_name = field_name
+        self.local = local  # local field names on the parent entity, declared order
+        self.target = target  # target primary-key field names, declared order
+        self.as_array = as_array  # whether local/target were declared in array form
+        self.non_null = non_null  # whether the object field is non-nullable
+        self.target_table = target_table
+        self.children = children  # nested _Leaf / _Link nodes, in selection order
 
 
 class SubscriptionPlan:
     """A compiled subscription ready to filter and project event snapshots."""
 
-    __slots__ = ("operation_name", "path", "entity_table", "filter", "projections")
+    __slots__ = (
+        "operation_name",
+        "path",
+        "entity_table",
+        "filter",
+        "tree",
+        "entity_keys",
+    )
 
     def __init__(
         self,
@@ -31,13 +84,17 @@ class SubscriptionPlan:
         path: str,
         entity_table: str,
         filter_obj: Dict[str, Any],
-        projections: List[Tuple[str, str]],
+        tree: List[Any],
+        entity_keys: Dict[str, List[str]],
     ):
         self.operation_name = operation_name
         self.path = path
         self.entity_table = entity_table
         self.filter = filter_obj  # entity field name -> expected value
-        self.projections = projections  # (response key, entity field name) pairs
+        self.tree = tree  # root selection nodes (_Leaf / _Link), selection order
+        # Every entity participating in the projection (root plus each @link
+        # target), mapped to its declared primary-key field names in order.
+        self.entity_keys = entity_keys
 
     def matches(self, snapshot: Dict[str, Any]) -> bool:
         for name, expected in self.filter.items():
@@ -49,15 +106,19 @@ class SubscriptionPlan:
                 return False
         return True
 
-    def project(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        data: Dict[str, Any] = {}
-        for key, field_name in self.projections:
-            if field_name not in snapshot:
-                raise PlanError(
-                    "EventError", f"snapshot is missing field '{field_name}'"
-                )
-            data[key] = snapshot[field_name]
-        return data
+
+def _is_list_type(type_ref) -> bool:
+    """Whether the field's GraphQL type contains a list wrapper."""
+    while type_ref[0] in ("list", "non_null"):
+        if type_ref[0] == "list":
+            return True
+        type_ref = type_ref[1]
+    return False
+
+
+def _is_keyable(value: Any) -> bool:
+    """Whether a snapshot value can participate in a primary-key tuple."""
+    return value is not None and not isinstance(value, (dict, list))
 
 
 class SubscriptionCompiler(Planner):
@@ -114,8 +175,13 @@ class SubscriptionCompiler(Planner):
             )
 
         filter_obj = self._compile_filter(field, target, entity.table, node)
-        projections = self._compile_projection(target, node.selection_set, key)
-        return SubscriptionPlan(op.name, key, entity.table, filter_obj, projections)
+        entity_keys: Dict[str, List[str]] = {entity.table: list(entity.key)}
+        tree = self._compile_tree(
+            target, entity, node.selection_set, key, entity_keys
+        )
+        return SubscriptionPlan(
+            op.name, key, entity.table, filter_obj, tree, entity_keys
+        )
 
     # -- operation selection ---------------------------------------------------
 
@@ -171,73 +237,236 @@ class SubscriptionCompiler(Planner):
             filter_obj[arg_name] = self._resolve(value)
         return filter_obj
 
-    # -- projection ---------------------------------------------------------------
+    # -- nested projection --------------------------------------------------------
 
-    def _compile_projection(
-        self, target, selection_set, path: str
-    ) -> List[Tuple[str, str]]:
-        projections: List[Tuple[str, str]] = []
+    def _compile_tree(
+        self,
+        info: TypeInfo,
+        entity: Entity,
+        selection_set,
+        path: str,
+        entity_keys: Dict[str, List[str]],
+    ) -> List[Any]:
+        selections = self._expand(selection_set, info.name, [])
+        if not selections:
+            raise PlanError("InvalidQuery", f"empty selection set at '{path}'")
+        nodes: List[Any] = []
         seen = set()
-        for node in self._expand(selection_set, target.name, []):
+        for node in selections:
             key = node.alias or node.name
-            field = target.fields.get(node.name)
+            node_path = f"{path}.{key}"
+            field = info.fields.get(node.name)
             if field is None:
                 raise PlanError(
                     "InvalidQuery",
-                    f"unknown field '{node.name}' on type '{target.name}'",
+                    f"unknown field '{node.name}' on type '{info.name}'",
                 )
-            if not self.schema.is_leaf(named_of(field.type_ref)):
-                raise PlanError(
-                    "UnsupportedSelection",
-                    f"nested field '{node.name}' is not supported in subscriptions",
-                )
-            if node.selection_set is not None:
-                raise PlanError(
-                    "InvalidQuery",
-                    f"scalar field '{node.name}' must not have a selection set",
-                )
+            type_name = named_of(field.type_ref)
+            if self.schema.is_leaf(type_name):
+                if node.selection_set is not None:
+                    raise PlanError(
+                        "InvalidQuery",
+                        f"scalar field '{node.name}' must not have a selection set",
+                    )
+                if node.args:
+                    raise PlanError(
+                        "InvalidQuery",
+                        f"arguments on field '{node.name}' are not supported",
+                    )
+                if key not in seen:
+                    seen.add(key)
+                    nodes.append(_Leaf(key, node.name))
+                continue
             if node.args:
                 raise PlanError(
                     "InvalidQuery",
                     f"arguments on field '{node.name}' are not supported",
                 )
+            if node.selection_set is None:
+                raise PlanError(
+                    "InvalidQuery", f"field '{node.name}' requires a selection set"
+                )
+            if field.link is None:
+                raise PlanError(
+                    "MappingError",
+                    f"field '{info.name}.{node.name}' is missing an @link directive",
+                )
+            if _is_list_type(field.type_ref):
+                raise PlanError(
+                    "UnsupportedSelection",
+                    f"list relation '{node.name}' is not supported in subscriptions",
+                )
+            target = self.schema.types.get(type_name)
+            if target is None:
+                raise PlanError(
+                    "MappingError",
+                    f"field '{info.name}.{node.name}' has unsupported type '{type_name}'",
+                )
+            target_entity = target.entity
+            if target_entity is None:
+                raise PlanError(
+                    "UnknownEntity",
+                    f"type '{target.name}' is not mapped to an entity",
+                )
+            local, target_key, as_array = field.link
+            if target_key != target_entity.key:
+                raise PlanError(
+                    "InvalidJoin",
+                    f"@link target {target_key} does not match the primary key of entity '{target_entity.table}'",
+                )
+            entity_keys.setdefault(
+                target_entity.table, list(target_entity.key)
+            )
+            children = self._compile_tree(
+                target, target_entity, node.selection_set, node_path, entity_keys
+            )
             if key not in seen:
                 seen.add(key)
-                projections.append((key, node.name))
-        if not projections:
+                nodes.append(
+                    _Link(
+                        key,
+                        node.name,
+                        local,
+                        target_key,
+                        as_array,
+                        field.type_ref[0] == "non_null",
+                        target_entity.table,
+                        children,
+                    )
+                )
+        if not nodes:
             raise PlanError("InvalidQuery", f"empty selection set at '{path}'")
-        return projections
+        return nodes
 
 
 def push_events(
     plan: SubscriptionPlan, events_text: str, source: str
 ) -> List[Dict[str, Any]]:
-    """Apply a compiled subscription to an NDJSON event stream, in order."""
+    """Apply a compiled subscription to an NDJSON stream, in order.
+
+    Each line is parsed and validated before any snapshot state changes. The
+    latest snapshot of every entity participating in the projection is kept in
+    a primary-keyed store; an emitted root event projects its own after/before
+    snapshot and resolves each selected @link from the freshest target
+    snapshots available as of the current line.
+    """
     outputs: List[Dict[str, Any]] = []
+    # table -> primary key tuple -> latest snapshot dict
+    stores: Dict[str, Dict[tuple, Dict[str, Any]]] = {
+        table: {} for table in plan.entity_keys
+    }
+
+    def primary_key(
+        table: str, key_fields: List[str], snapshot: Dict[str, Any], where: str
+    ) -> tuple:
+        values: List[Any] = []
+        for name in key_fields:
+            if name not in snapshot:
+                raise PlanError(
+                    "EventError",
+                    f"{where}: snapshot of '{table}' is missing key field '{name}'",
+                )
+            value = snapshot[name]
+            if not _is_keyable(value):
+                raise PlanError(
+                    "EventError",
+                    f"{where}: snapshot of '{table}' has an invalid value for key field '{name}'",
+                )
+            values.append(value)
+        return tuple(values)
+
+    def project(
+        nodes: List[Any],
+        snapshot: Dict[str, Any],
+        table: str,
+        where: str,
+    ) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        for node in nodes:
+            if isinstance(node, _Leaf):
+                if node.field_name not in snapshot:
+                    raise PlanError(
+                        "EventError",
+                        f"{where}: snapshot of '{table}' is missing field '{node.field_name}'",
+                    )
+                data[node.response_key] = snapshot[node.field_name]
+                continue
+
+            local_values: List[Any] = []
+            for local_name in node.local:
+                if local_name not in snapshot:
+                    raise PlanError(
+                        "EventError",
+                        f"{where}: snapshot of '{table}' is missing @link local field '{local_name}' for '{node.field_name}'",
+                    )
+            raw_values = [snapshot[name] for name in node.local]
+            if any(value is None for value in raw_values):
+                if node.non_null:
+                    raise PlanError(
+                        "EventError",
+                        f"{where}: relation '{node.field_name}' on '{table}' resolved to null but is declared non-null",
+                    )
+                data[node.response_key] = None
+                continue
+            for value in raw_values:
+                if not _is_keyable(value):
+                    raise PlanError(
+                        "EventError",
+                        f"{where}: @link '{node.field_name}' on '{table}' has a value that cannot form the primary key of '{node.target_table}'",
+                    )
+                local_values.append(value)
+            target_snapshot = stores[node.target_table].get(tuple(local_values))
+            if target_snapshot is None:
+                raise PlanError(
+                    "EventError",
+                    f"{where}: @link '{node.field_name}' on '{table}' has no current snapshot of '{node.target_table}' with key {tuple(local_values)!r}",
+                )
+            data[node.response_key] = project(
+                node.children, target_snapshot, node.target_table, where
+            )
+        return data
+
     for lineno, raw in enumerate(events_text.splitlines(), 1):
         line = raw.strip()
         if not line:
             continue
+        where = f"{source}:{lineno}"
         event = _parse_event(line, source, lineno)
-        if event["entity"] != plan.entity_table:
+        table = event["entity"]
+        key_fields = plan.entity_keys.get(table)
+        if key_fields is None:
+            # Events of entities that take no part in this subscription are
+            # validated for shape but otherwise skipped.
             continue
+
         op = event["op"]
-        snapshot = event["after"] if op in ("INSERT", "UPDATE") else event["before"]
-        if snapshot is None:
-            raise PlanError(
-                "EventError", f"{source}:{lineno}: {op} event has no snapshot"
+        if op in ("INSERT", "UPDATE"):
+            snapshot = event["after"]
+            if snapshot is None:
+                raise PlanError(
+                    "EventError", f"{where}: {op} event has no snapshot"
+                )
+            pk = primary_key(table, key_fields, snapshot, where)
+            stores[table][pk] = snapshot
+        else:
+            snapshot = event["before"]
+            if snapshot is None:
+                raise PlanError(
+                    "EventError", f"{where}: {op} event has no snapshot"
+                )
+            pk = primary_key(table, key_fields, snapshot, where)
+            stores[table].pop(pk, None)
+
+        if table == plan.entity_table and plan.matches(snapshot):
+            outputs.append(
+                {
+                    "subscription": plan.operation_name,
+                    "path": plan.path,
+                    "event": op,
+                    "entity": table,
+                    "data": project(plan.tree, snapshot, table, where),
+                }
             )
-        if not plan.matches(snapshot):
-            continue
-        outputs.append(
-            {
-                "subscription": plan.operation_name,
-                "path": plan.path,
-                "event": op,
-                "entity": event["entity"],
-                "data": plan.project(snapshot),
-            }
-        )
     return outputs
 
 

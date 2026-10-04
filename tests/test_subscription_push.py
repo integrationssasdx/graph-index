@@ -246,9 +246,14 @@ class CliCase(unittest.TestCase):
             *self.run_cli("subscription { users { id { x } } }"), "InvalidQuery"
         )
 
-    def test_nested_object_unsupported(self):
+    def test_list_relation_unsupported(self):
+        schema = SCHEMA + """
+        extend type User { accounts: [Account!]! @link(local: "id", target: "id") }
+        type Account @entity(name: "accounts", key: "id") { id: ID! }
+        """
         self.assert_error(
-            *self.run_cli("subscription { users { team { id } } }"),
+            *self.run_cli("subscription { users { accounts { id } } }",
+                          schema=schema),
             "UnsupportedSelection",
         )
 
@@ -424,6 +429,351 @@ class CliCase(unittest.TestCase):
         self.assert_error(
             *self.run_cli("subscription { transfers { id } }", schema=schema),
             "MappingError",
+        )
+
+    # -- nested @link projection --------------------------------------------------
+
+    LEAGUE_SCHEMA = SCHEMA + """
+    extend type Team {
+      league_id: ID
+      league: League @link(local: "league_id", target: "id")
+    }
+    type League @entity(name: "leagues", key: "id") {
+      id: ID!
+      title: String!
+    }
+    """
+
+    @staticmethod
+    def _events(rows):
+        return "\n".join(json.dumps(row) for row in rows) + "\n"
+
+    def _user(self, uid, team_id=None, status="active", name=None):
+        return {
+            "op": "INSERT", "entity": "users", "before": None,
+            "after": {"id": uid, "name": name or f"user{uid}", "status": status,
+                      "role": "MEMBER", "tags": [], "team_id": team_id},
+        }
+
+    def test_nested_object_projects_nested_data(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, 9),
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["data"], {"id": 1, "team": {"name": "core"}})
+
+    def test_nested_fields_are_not_flattened(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, 9),
+        ])
+        subscription = "subscription { users { name team { id name } } }"
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual(
+            rows[0]["data"],
+            {"name": "user1", "team": {"id": 9, "name": "core"}},
+        )
+
+    def test_nested_aliases_are_honored(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, 9),
+        ])
+        subscription = "subscription { users { who: name t: team { teamName: name } } }"
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual(
+            rows[0]["data"], {"who": "user1", "t": {"teamName": "core"}}
+        )
+
+    def test_nested_fragments_expanded_and_merged(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, 9),
+        ])
+        subscription = """
+        subscription {
+          users {
+            id
+            ...UserBits
+            team { id ...TeamBits }
+          }
+        }
+        fragment UserBits on User { name }
+        fragment TeamBits on Team { name }
+        """
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 1, "name": "user1", "team": {"id": 9, "name": "core"}},
+        )
+
+    def test_nested_leaf_deduplicated(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, 9),
+        ])
+        subscription = """
+        subscription { users { id team { name name } } }
+        """
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual(rows[0]["data"], {"id": 1, "team": {"name": "core"}})
+
+    def test_nested_relation_resolves_from_latest_snapshot(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, 9, name="ada"),
+            {"op": "UPDATE", "entity": "teams",
+             "before": {"id": 9, "name": "core"},
+             "after": {"id": 9, "name": "platform"}},
+            self._user(2, 9, name="bob"),
+        ])
+        subscription = "subscription { users { name team { name } } }"
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual(rows[0]["data"]["team"], {"name": "core"})
+        self.assertEqual(rows[1]["data"]["team"], {"name": "platform"})
+
+    def test_target_snapshot_seen_after_root_event_is_not_retroactive(self):
+        events = self._events([
+            self._user(1, 9),
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        self.assert_error(*self.run_cli(subscription, events=events), "EventError")
+
+    def test_deleted_target_snapshot_cannot_resolve(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            {"op": "DELETE", "entity": "teams",
+             "before": {"id": 9, "name": "core"}, "after": None},
+            self._user(1, 9),
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        self.assert_error(*self.run_cli(subscription, events=events), "EventError")
+
+    def test_null_local_resolves_to_nested_null(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, None),
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual(rows[0]["data"], {"id": 1, "team": None})
+
+    def test_null_local_on_non_null_relation_is_event_error(self):
+        schema = SCHEMA.replace(
+            "team: Team @link(local: \"team_id\", target: \"id\")",
+            "team: Team! @link(local: \"team_id\", target: \"id\")",
+        )
+        events = self._events([
+            self._user(1, None),
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        self.assert_error(
+            *self.run_cli(subscription, schema=schema, events=events),
+            "EventError",
+        )
+
+    def test_missing_local_field_on_root_snapshot_is_event_error(self):
+        # team_id absent (not null) on the root snapshot
+        user = self._user(1, 9)
+        del user["after"]["team_id"]
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            user,
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        self.assert_error(*self.run_cli(subscription, events=events), "EventError")
+
+    def test_missing_target_leaf_field_is_event_error(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9}},
+            self._user(1, 9),
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        self.assert_error(*self.run_cli(subscription, events=events), "EventError")
+
+    def test_root_filter_still_applies_with_nested_selection(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core"}},
+            self._user(1, 9, status="active"),
+            self._user(2, 9, status="banned"),
+        ])
+        subscription = (
+            "subscription { users(status: \"active\") { id team { name } } }"
+        )
+        rows = self.assert_rows(*self.run_cli(subscription, events=events))
+        self.assertEqual([r["data"]["id"] for r in rows], [1])
+        self.assertEqual(rows[0]["data"], {"id": 1, "team": {"name": "core"}})
+
+    def test_multi_level_nesting(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "leagues", "before": None,
+             "after": {"id": 7, "title": "major"}},
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core", "league_id": 7}},
+            self._user(1, 9),
+        ])
+        subscription = (
+            "subscription { users { id team { name league { title } } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=self.LEAGUE_SCHEMA, events=events)
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 1, "team": {"name": "core", "league": {"title": "major"}}},
+        )
+
+    def test_multi_level_null_mid_chain_propagates_as_null(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"id": 9, "name": "core", "league_id": None}},
+            self._user(1, 9),
+        ])
+        subscription = (
+            "subscription { users { id team { name league { title } } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=self.LEAGUE_SCHEMA, events=events)
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 1, "team": {"name": "core", "league": None}},
+        )
+
+    def test_composite_key_nested_resolution(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "tokens", "before": None,
+             "after": {"chain_id": 1, "id": "tok", "symbol": "TKN"}},
+            {"op": "INSERT", "entity": "transfers", "before": None,
+             "after": {"chain_id": 1, "id": "t1", "amount": 3.5,
+                       "token_chain": 1, "token_id": "tok"}},
+        ])
+        subscription = (
+            "subscription { transfers(chain_id: 1) "
+            "{ chain_id id token { symbol } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=COMPOSITE_SCHEMA, events=events)
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["data"],
+            {"chain_id": 1, "id": "t1", "token": {"symbol": "TKN"}},
+        )
+
+    def test_composite_key_partial_local_null_resolves_null(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "transfers", "before": None,
+             "after": {"chain_id": 1, "id": "t1",
+                       "token_chain": None, "token_id": "tok"}},
+        ])
+        subscription = (
+            "subscription { transfers { id token { symbol } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=COMPOSITE_SCHEMA, events=events)
+        )
+        self.assertEqual(rows[0]["data"], {"id": "t1", "token": None})
+
+    def test_composite_key_missing_local_field_is_event_error(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "transfers", "before": None,
+             "after": {"chain_id": 1, "id": "t1", "token_id": "tok"}},
+        ])
+        subscription = (
+            "subscription { transfers { id token { symbol } } }"
+        )
+        self.assert_error(
+            *self.run_cli(subscription, schema=COMPOSITE_SCHEMA, events=events),
+            "EventError",
+        )
+
+    def test_target_event_with_missing_primary_key_field_is_event_error(self):
+        events = self._events([
+            {"op": "INSERT", "entity": "teams", "before": None,
+             "after": {"name": "core"}},
+            self._user(1, 9),
+        ])
+        subscription = "subscription { users { id team { name } } }"
+        self.assert_error(*self.run_cli(subscription, events=events), "EventError")
+
+    # -- nested selection compile errors -------------------------------------------
+
+    def test_nested_empty_selection(self):
+        self.assert_error(
+            *self.run_cli("subscription { users { team { } } }"),
+            "InvalidQuery",
+        )
+
+    def test_unknown_nested_field(self):
+        self.assert_error(
+            *self.run_cli("subscription { users { team { nope } } }"),
+            "InvalidQuery",
+        )
+
+    def test_nested_scalar_with_selection(self):
+        self.assert_error(
+            *self.run_cli("subscription { users { team { name { x } } } }"),
+            "InvalidQuery",
+        )
+
+    def test_nested_object_without_selection(self):
+        self.assert_error(
+            *self.run_cli("subscription { users { id team } }"),
+            "InvalidQuery",
+        )
+
+    def test_nested_arguments_rejected(self):
+        self.assert_error(
+            *self.run_cli("subscription { users { team(x: 1) { id } } }"),
+            "InvalidQuery",
+        )
+
+    def test_nested_object_without_link_is_mapping_error(self):
+        schema = SCHEMA + """
+        extend type User { org: Org }
+        type Org @entity(name: "orgs", key: "id") { id: ID! name: String }
+        """
+        self.assert_error(
+            *self.run_cli("subscription { users { org { name } } }",
+                          schema=schema),
+            "MappingError",
+        )
+
+    def test_nested_target_not_entity_is_unknown_entity(self):
+        schema = SCHEMA + """
+        extend type User { profile: Profile @link(local: "team_id", target: "id") }
+        type Profile { id: ID! label: String }
+        """
+        self.assert_error(
+            *self.run_cli("subscription { users { profile { label } } }",
+                          schema=schema),
+            "UnknownEntity",
+        )
+
+    def test_nested_link_target_wrong_order_is_invalid_join(self):
+        schema = COMPOSITE_SCHEMA.replace(
+            'target: ["chain_id", "id"]', 'target: ["id", "chain_id"]'
+        )
+        subscription = "subscription { transfers { token { symbol } } }"
+        self.assert_error(
+            *self.run_cli(subscription, schema=schema), "InvalidJoin"
         )
 
 
