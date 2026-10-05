@@ -124,6 +124,62 @@ type Org @entity(name: "orgs", key: "id") {
 }
 """
 
+LIST_SCHEMA = """\
+type Query {
+  users: [User!]!
+}
+
+type Subscription {
+  users(id: ID, status: String): [User!]!
+}
+
+type User @entity(name: "users", key: "id") {
+  id: ID!
+  name: String!
+  status: String
+  org_id: ID
+  org: Org @link(local: "org_id", target: "id")
+  mates: [User!]! @link(local: "org_id", target: "org_id")
+  reviews: [Review!]! @link(local: "id", target: "user_id")
+}
+
+type Org @entity(name: "orgs", key: "id") {
+  id: ID!
+  name: String!
+  members: [User!]! @link(local: "id", target: "org_id")
+}
+
+type Review @entity(name: "reviews", key: "id") {
+  id: ID!
+  user_id: ID
+  score: Int
+}
+"""
+
+COMPOSITE_LIST_SCHEMA = """\
+type Query {
+  orders: [Order!]!
+}
+
+type Subscription {
+  orders(chain: Int, ref: ID): [Order!]!
+}
+
+type Order @entity(name: "orders", key: "id") {
+  id: ID!
+  chain: Int
+  ref: ID
+  lines: [Line!]! @link(local: ["chain", "ref"], target: ["chain", "ref"])
+}
+
+type Line @entity(name: "lines", key: "id") {
+  id: ID!
+  chain: Int
+  ref: ID
+  qty: Int
+}
+"""
+
 
 def _event(op, entity, before, after):
     return json.dumps({"op": op, "entity": entity, "before": before,
@@ -304,17 +360,6 @@ class CliCase(unittest.TestCase):
     def test_leaf_with_selection(self):
         self.assert_error(
             *self.run_cli("subscription { users { id { x } } }"), "InvalidQuery"
-        )
-
-    def test_list_relationship_unsupported(self):
-        schema = SCHEMA + (
-            'extend type User { mates: [User!]! '
-            '@link(local: "team_id", target: "team_id") }\n'
-        )
-        self.assert_error(
-            *self.run_cli("subscription { users { id mates { id } } }",
-                          schema=schema),
-            "UnsupportedSelection",
         )
 
     def test_unknown_argument(self):
@@ -700,6 +745,383 @@ class CliCase(unittest.TestCase):
             )
         )
         self.assertEqual(rows[0]["data"], {"id": "x1", "token": None})
+
+    # -- list @link projections ---------------------------------------------------
+
+    def test_list_matches_targets_and_preserves_insert_order(self):
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 7, "score": 1}),
+            _event("INSERT", "reviews", None,
+                   {"id": "r2", "user_id": 7, "score": 2}),
+            _event("INSERT", "users", None,
+                   {"id": 7, "name": "grace", "org_id": 1}),
+        ]) + "\n"
+        subscription = (
+            "subscription { users { id reviews { id score } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=LIST_SCHEMA, events=events)
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 7, "reviews": [
+                {"id": "r1", "score": 1},
+                {"id": "r2", "score": 2},
+            ]},
+        )
+
+    def test_list_target_may_match_non_primary_key_field(self):
+        events = "\n".join([
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 9}),
+            _event("INSERT", "users", None,
+                   {"id": 2, "name": "bob", "org_id": 9}),
+            _event("INSERT", "users", None,
+                   {"id": 3, "name": "cy", "org_id": 4}),
+        ]) + "\n"
+        subscription = "subscription { users { id mates { id } } }"
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=LIST_SCHEMA, events=events)
+        )
+        # Only targets inserted up to and including the current line match.
+        self.assertEqual(
+            [r["data"] for r in rows],
+            [
+                {"id": 1, "mates": [{"id": 1}]},
+                {"id": 2, "mates": [{"id": 1}, {"id": 2}]},
+                {"id": 3, "mates": [{"id": 3}]},
+            ],
+        )
+
+    def test_list_no_match_or_null_local_is_empty_array(self):
+        events = "\n".join([
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 9}),
+            _event("INSERT", "users", None,
+                   {"id": 2, "name": "bob", "org_id": None}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id reviews { id } } }",
+                schema=LIST_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual(
+            [r["data"] for r in rows],
+            [{"id": 1, "reviews": []}, {"id": 2, "reviews": []}],
+        )
+
+    def test_list_update_preserves_position(self):
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 7, "score": 1}),
+            _event("INSERT", "reviews", None,
+                   {"id": "r2", "user_id": 7, "score": 2}),
+            _event("UPDATE", "reviews",
+                   {"id": "r1", "user_id": 7, "score": 1},
+                   {"id": "r1", "user_id": 7, "score": 10}),
+            _event("INSERT", "users", None,
+                   {"id": 7, "name": "grace", "org_id": 1}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { reviews { id score } } }",
+                schema=LIST_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual(
+            rows[0]["data"]["reviews"],
+            [{"id": "r1", "score": 10}, {"id": "r2", "score": 2}],
+        )
+
+    def test_list_target_enter_leave_reenter_group(self):
+        # An UPDATE that changes the matched field moves a row out of and into
+        # a relationship; position is still governed by its original insert.
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 7, "score": 1}),
+            _event("INSERT", "reviews", None,
+                   {"id": "r2", "user_id": 7, "score": 2}),
+            _event("INSERT", "users", None,
+                   {"id": 7, "name": "grace", "org_id": 1}),
+            _event("UPDATE", "reviews",
+                   {"id": "r1", "user_id": 7, "score": 1},
+                   {"id": "r1", "user_id": 8, "score": 1}),
+            _event("UPDATE", "users",
+                   {"id": 7, "name": "grace", "org_id": 1},
+                   {"id": 7, "name": "grace", "org_id": 1}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { reviews { id } } }",
+                schema=LIST_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual(rows[0]["data"]["reviews"], [
+            {"id": "r1"}, {"id": "r2"},
+        ])
+        self.assertEqual(rows[1]["data"]["reviews"], [{"id": "r2"}])
+
+    def test_list_delete_then_reinsert_goes_to_end(self):
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 7, "score": 1}),
+            _event("INSERT", "reviews", None,
+                   {"id": "r2", "user_id": 7, "score": 2}),
+            _event("INSERT", "users", None,
+                   {"id": 7, "name": "grace", "org_id": 1}),
+            _event("DELETE", "reviews",
+                   {"id": "r1", "user_id": 7, "score": 1}, None),
+            _event("UPDATE", "users",
+                   {"id": 7, "name": "grace", "org_id": 1},
+                   {"id": 7, "name": "grace", "org_id": 1}),
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 7, "score": 11}),
+            _event("UPDATE", "users",
+                   {"id": 7, "name": "grace", "org_id": 1},
+                   {"id": 7, "name": "grace", "org_id": 1}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { reviews { id score } } }",
+                schema=LIST_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual(rows[0]["data"]["reviews"], [
+            {"id": "r1", "score": 1}, {"id": "r2", "score": 2},
+        ])
+        self.assertEqual(rows[1]["data"]["reviews"], [
+            {"id": "r2", "score": 2},
+        ])
+        # re-INSERTed r1 sorts after r2 even though it first appeared earlier
+        self.assertEqual(rows[2]["data"]["reviews"], [
+            {"id": "r2", "score": 2}, {"id": "r1", "score": 11},
+        ])
+
+    def test_list_at_root_alias_and_fragment_preserved(self):
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 7, "score": 5}),
+            _event("INSERT", "users", None,
+                   {"id": 7, "name": "grace", "org_id": 1}),
+        ]) + "\n"
+        subscription = """
+        subscription {
+          users {
+            id
+            myReviews: reviews { reviewId: id ...ScoreBit }
+          }
+        }
+        fragment ScoreBit on Review { score }
+        """
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=LIST_SCHEMA, events=events)
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 7, "myReviews": [{"reviewId": "r1", "score": 5}]},
+        )
+
+    def test_list_nested_inside_object_link(self):
+        events = "\n".join([
+            _event("INSERT", "orgs", None, {"id": 9, "name": "core"}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 9}),
+            _event("INSERT", "users", None,
+                   {"id": 2, "name": "bob", "org_id": 9}),
+        ]) + "\n"
+        subscription = (
+            "subscription { users { id org { name members { id } } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=LIST_SCHEMA, events=events)
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 1, "org": {"name": "core", "members": [{"id": 1}]}},
+        )
+        self.assertEqual(
+            rows[1]["data"],
+            {"id": 2, "org": {"name": "core", "members": [
+                {"id": 1}, {"id": 2},
+            ]}},
+        )
+
+    def test_list_field_alongside_object_link_recurses(self):
+        events = "\n".join([
+            _event("INSERT", "orgs", None, {"id": 9, "name": "core"}),
+            _event("INSERT", "reviews", None,
+                   {"id": "x", "user_id": 1, "score": 3}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 9}),
+        ]) + "\n"
+        subscription = (
+            "subscription { users { id org { name } reviews { score } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=LIST_SCHEMA, events=events)
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 1,
+             "org": {"name": "core"},
+             "reviews": [{"score": 3}]},
+        )
+
+    def test_composite_non_primary_key_list_match(self):
+        events = "\n".join([
+            _event("INSERT", "lines", None,
+                   {"id": "a", "chain": 1, "ref": "R", "qty": 2}),
+            _event("INSERT", "lines", None,
+                   {"id": "b", "chain": 1, "ref": "R", "qty": 5}),
+            _event("INSERT", "lines", None,
+                   {"id": "c", "chain": 2, "ref": "R", "qty": 9}),
+            _event("INSERT", "orders", None,
+                   {"id": "o1", "chain": 1, "ref": "R"}),
+        ]) + "\n"
+        subscription = (
+            "subscription { orders(chain: 1) { id lines { id qty } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(
+                subscription, schema=COMPOSITE_LIST_SCHEMA, events=events
+            )
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": "o1", "lines": [
+                {"id": "a", "qty": 2}, {"id": "b", "qty": 5},
+            ]},
+        )
+
+    def test_list_snapshot_missing_local_field_is_event_error(self):
+        events = _event(
+            "INSERT", "users", None, {"id": 1, "name": "ada"}
+        ) + "\n"
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id mates { id } } }",
+                schema=LIST_SCHEMA, events=events,
+            ),
+            "EventError",
+        )
+
+    def test_list_unbuildable_local_value_is_event_error(self):
+        events = _event(
+            "INSERT", "users", None,
+            {"id": 1, "name": "ada", "org_id": {"x": 1}},
+        ) + "\n"
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id mates { id } } }",
+                schema=LIST_SCHEMA, events=events,
+            ),
+            "EventError",
+        )
+
+    def test_list_target_snapshot_missing_match_field_is_event_error(self):
+        events = "\n".join([
+            _event("INSERT", "reviews", None, {"id": "r1", "score": 1}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 1}),
+        ]) + "\n"
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id reviews { score } } }",
+                schema=LIST_SCHEMA, events=events,
+            ),
+            "EventError",
+        )
+
+    def test_list_target_snapshot_missing_selected_field_is_event_error(self):
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 1}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 1}),
+        ]) + "\n"
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id reviews { score } } }",
+                schema=LIST_SCHEMA, events=events,
+            ),
+            "EventError",
+        )
+
+    def test_list_target_field_non_scalar_is_mapping_error(self):
+        # A list target field exists on the type (so schema loading accepts
+        # it) but cannot serve as an equality-match key for a list @link.
+        schema = LIST_SCHEMA + (
+            "extend type Review { tags: [String!] }\n"
+            "extend type User {"
+            " tagged: [Review!]! @link(local: \"id\", target: \"tags\")}\n"
+        )
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id tagged { id } } }",
+                schema=schema,
+            ),
+            "MappingError",
+        )
+
+    def test_list_target_field_missing_is_mapping_error(self):
+        schema = LIST_SCHEMA + (
+            "extend type User {"
+            " weird: [Review!]! @link(local: \"id\", target: \"nope\")}\n"
+        )
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id weird { id } } }",
+                schema=schema,
+            ),
+            "MappingError",
+        )
+
+    def test_list_local_field_list_wrapped_scalar_is_mapping_error(self):
+        schema = LIST_SCHEMA + (
+            "extend type User { codes: [String!] }\n"
+            "extend type User {"
+            " coded: [Review!]! @link(local: \"codes\", target: \"score\")}\n"
+        )
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id coded { id } } }",
+                schema=schema,
+            ),
+            "MappingError",
+        )
+
+    def test_list_matched_target_missing_primary_key_is_event_error(self):
+        # A review row that cannot build its primary key still participates in
+        # target matching and must surface as EventError once it matches.
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"user_id": 1, "score": 5}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 1}),
+        ]) + "\n"
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id reviews { score } } }",
+                schema=LIST_SCHEMA, events=events,
+            ),
+            "EventError",
+        )
+
+    def test_list_link_to_non_entity_target_is_unknown_entity(self):
+        schema = LIST_SCHEMA + (
+            "type Note { id: ID! }\n"
+            "extend type User {"
+            " notes: [Note!]! @link(local: \"id\", target: \"id\")}\n"
+        )
+        self.assert_error(
+            *self.run_cli(
+                "subscription { users { id notes { id } } }",
+                schema=schema,
+            ),
+            "UnknownEntity",
+        )
 
     # -- nested selection compile errors -------------------------------------------
 

@@ -4,8 +4,13 @@ Compiles a subscription operation into an equality filter plus a field
 projection over a single @entity root, then applies it to an NDJSON stream of
 entity change events. GraphQL, variable and @entity mapping semantics are
 shared with the query planner; the supported selection shape covers leaf
-fields and nested object fields reached through @link joins (one or more
-levels deep, including aliases and fragment spreads).
+fields, nested object fields and nested list fields reached through @link
+joins (one or more levels deep, including aliases and fragment spreads).
+
+List fields match every current target snapshot whose @link target field
+values equal the source's local field values; the matched targets are
+recursively projected in target insert order. The @link target of a list
+relationship need not be (part of) the target entity's primary key.
 """
 
 from __future__ import annotations
@@ -69,13 +74,15 @@ class LinkedField:
 
     Leaf fields carry ``field_name`` and no children. Link fields carry the
     validated @link mapping (local/target field names, target entity) and a
-    list of compiled children.
+    list of compiled children; ``is_list`` selects list (ordered, possibly
+    many) rather than single-object resolution.
     """
 
     __slots__ = (
         "response_key",
         "field_name",
         "required",
+        "is_list",
         "local",
         "target",
         "target_table",
@@ -87,6 +94,7 @@ class LinkedField:
         response_key: str,
         field_name: str,
         required: bool = False,
+        is_list: bool = False,
         local: Optional[List[str]] = None,
         target: Optional[List[str]] = None,
         target_table: Optional[str] = None,
@@ -95,8 +103,9 @@ class LinkedField:
         self.response_key = response_key
         self.field_name = field_name
         self.required = required  # field declared as a non-null object type
+        self.is_list = is_list
         self.local = local  # source-side key field names, in @link order
-        self.target = target  # target primary key field names, in @link order
+        self.target = target  # target-side matched field names, in @link order
         self.target_table = target_table
         self.children = children
 
@@ -267,11 +276,7 @@ class SubscriptionCompiler(Planner):
                 raise PlanError(
                     "InvalidQuery", f"field '{node.name}' requires a selection set"
                 )
-            if _is_list_type(field.type_ref):
-                raise PlanError(
-                    "UnsupportedSelection",
-                    f"list relationship '{node.name}' is not supported in subscriptions",
-                )
+            is_list = _is_list_type(field.type_ref)
             required = field.type_ref[0] == "non_null"
             if field.link is None:
                 raise PlanError(
@@ -291,7 +296,33 @@ class SubscriptionCompiler(Planner):
                     f"type '{target_info.name}' is not mapped to an entity",
                 )
             local, target_key, _as_array = field.link
-            if target_key != target_entity.key:
+            if is_list:
+                # A list relationship matches equality on arbitrary scalar
+                # target fields (they need not form the target primary key),
+                # so every matched field must hold a single scalar value.
+                for name in local:
+                    matched_local = info.fields.get(name)
+                    if not _is_scalar_value_field(self.schema, matched_local):
+                        raise PlanError(
+                            "MappingError",
+                            f"@link local field '{name}' of type '{info.name}' "
+                            f"must be a scalar",
+                        )
+                for name in target_key:
+                    matched = target_info.fields.get(name)
+                    if matched is None:
+                        raise PlanError(
+                            "MappingError",
+                            f"@link target field '{name}' is not a field of type "
+                            f"'{target_info.name}'",
+                        )
+                    if not _is_scalar_value_field(self.schema, matched):
+                        raise PlanError(
+                            "MappingError",
+                            f"@link target field '{name}' of type "
+                            f"'{target_info.name}' must be a scalar",
+                        )
+            elif target_key != target_entity.key:
                 raise PlanError(
                     "InvalidJoin",
                     f"@link target {target_key} does not match the primary key of "
@@ -312,6 +343,7 @@ class SubscriptionCompiler(Planner):
                         key,
                         node.name,
                         required=required,
+                        is_list=is_list,
                         local=list(local),
                         target=list(target_key),
                         target_table=target_entity.table,
@@ -328,9 +360,54 @@ def _is_list_type(type_ref) -> bool:
     return type_ref[0] == "list"
 
 
+def _is_scalar_value_field(schema, field) -> bool:
+    """Whether a field holds a single (non-list) built-in/custom scalar."""
+    if field is None:
+        return False
+    return (
+        not _is_list_type(field.type_ref)
+        and named_of(field.type_ref) in schema.scalars
+    )
+
+
 # ---------------------------------------------------------------------------
 # Event processing
 # ---------------------------------------------------------------------------
+
+
+class _OrderedStore:
+    """Latest snapshots of one entity, kept in insert order.
+
+    INSERT introduces a new row at the end; UPDATE replaces a row in place and
+    preserves its position; DELETE removes a row, so a later re-INSERT is
+    appended at the end again. Snapshots whose primary key cannot be built
+    cannot participate in keyed identity (and therefore cannot be deleted by
+    key); they are retained separately so a list match on non-key target
+    fields can surface them as an EventError instead of silently dropping them.
+    """
+
+    __slots__ = ("rows", "keyless")
+
+    def __init__(self):
+        self.rows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self.keyless: List[Dict[str, Any]] = []
+
+    def upsert(self, key: Optional[Tuple[Any, ...]], snapshot: Dict[str, Any]) -> None:
+        # Dict assignment appends a new key at the end and replaces an existing
+        # key's value without moving it, which is exactly the required order.
+        if key is None:
+            self.keyless.append(snapshot)
+        else:
+            self.rows[key] = snapshot
+
+    def delete(self, key: Optional[Tuple[Any, ...]]) -> None:
+        # A keyed row is removed so a later upsert re-appends it at the end; a
+        # keyless DELETE cannot identify a stored row and leaves them untouched.
+        if key is not None:
+            self.rows.pop(key, None)
+
+    def values(self) -> List[Dict[str, Any]]:
+        return list(self.rows.values())
 
 
 def push_events(
@@ -349,7 +426,7 @@ def push_events(
             continue
         events.append((lineno, _parse_event(line, source, lineno)))
 
-    snapshots: Dict[str, Dict[Tuple[Any, ...], Dict[str, Any]]] = {}
+    snapshots: Dict[str, _OrderedStore] = {}
     outputs: List[Dict[str, Any]] = []
     for lineno, event in events:
         _apply_event(plan.entity_keys, snapshots, event)
@@ -364,7 +441,13 @@ def push_events(
         if not plan.matches(snapshot):
             continue
         data = _project(
-            plan.tree.children, snapshot, snapshots, source, lineno, plan.path
+            plan.tree.children,
+            snapshot,
+            snapshots,
+            plan.entity_keys,
+            source,
+            lineno,
+            plan.path,
         )
         outputs.append(
             {
@@ -380,7 +463,7 @@ def push_events(
 
 def _apply_event(
     entity_keys: Dict[str, List[str]],
-    snapshots: Dict[str, Dict[Tuple[Any, ...], Dict[str, Any]]],
+    snapshots: Dict[str, _OrderedStore],
     event: Dict[str, Any],
 ) -> None:
     """Update the latest-snapshot store for one validated event.
@@ -393,17 +476,15 @@ def _apply_event(
     key_fields = entity_keys.get(event["entity"])
     if key_fields is None:
         return
-    store = snapshots.setdefault(event["entity"], {})
+    store = snapshots.setdefault(event["entity"], _OrderedStore())
     if event["op"] in ("INSERT", "UPDATE"):
         snapshot = event["after"]
-        key = _key_tuple(key_fields, snapshot)
-        if snapshot is not None and key is not None:
-            store[key] = snapshot
+        if snapshot is not None:
+            store.upsert(_key_tuple(key_fields, snapshot), snapshot)
         return
     snapshot = event["before"]
-    key = _key_tuple(key_fields, snapshot)
-    if snapshot is not None and key is not None:
-        store.pop(key, None)
+    if snapshot is not None:
+        store.delete(_key_tuple(key_fields, snapshot))
 
 
 def _key_tuple(
@@ -424,7 +505,8 @@ def _key_tuple(
 def _project(
     nodes: List[LinkedField],
     snapshot: Dict[str, Any],
-    snapshots: Dict[str, Dict[Tuple[Any, ...], Dict[str, Any]]],
+    snapshots: Dict[str, _OrderedStore],
+    entity_keys: Dict[str, List[str]],
     source: str,
     lineno: int,
     path: str,
@@ -442,7 +524,12 @@ def _project(
                 )
             data[node.response_key] = snapshot[node.field_name]
             continue
-        related = _resolve_link(node, snapshot, snapshots, source, lineno, node_path)
+        if node.is_list:
+            data[node.response_key] = _project_list(
+                node, snapshot, snapshots, entity_keys, source, lineno, node_path
+            )
+            continue
+        related = _resolve_object(node, snapshot, snapshots, source, lineno, node_path)
         if related is None:
             if node.required:
                 raise PlanError(
@@ -453,25 +540,56 @@ def _project(
             data[node.response_key] = None
         else:
             data[node.response_key] = _project(
-                node.children, related, snapshots, source, lineno, node_path
+                node.children,
+                related,
+                snapshots,
+                entity_keys,
+                source,
+                lineno,
+                node_path,
             )
     return data
 
 
-def _resolve_link(
+def _project_list(
     node: LinkedField,
     snapshot: Dict[str, Any],
-    snapshots: Dict[str, Dict[Tuple[Any, ...], Dict[str, Any]]],
+    snapshots: Dict[str, _OrderedStore],
+    entity_keys: Dict[str, List[str]],
     source: str,
     lineno: int,
     path: str,
-) -> Optional[Dict[str, Any]]:
-    """Follow one @link from a snapshot to the latest target snapshot.
+) -> List[Dict[str, Any]]:
+    """Resolve a list @link and project each matched target snapshot."""
+    matches = _resolve_list(
+        node, snapshot, snapshots, entity_keys, source, lineno, path
+    )
+    return [
+        _project(
+            node.children,
+            related,
+            snapshots,
+            entity_keys,
+            source,
+            lineno,
+            path,
+        )
+        for related in matches
+    ]
 
-    Returns None when any local key value is null (the relationship itself is
-    absent). Missing local key fields, values that cannot form the target
-    primary key or a target key without a current snapshot end the stream with
-    EventError.
+
+def _read_local(
+    node: LinkedField,
+    snapshot: Dict[str, Any],
+    source: str,
+    lineno: int,
+    path: str,
+) -> Optional[List[Any]]:
+    """Read the @link local key values from a source snapshot.
+
+    Returns None when any local value is null (the relationship itself is
+    absent). Missing local key fields or values that cannot form a scalar key
+    end the stream with EventError.
     """
     local_values: List[Any] = []
     for name in node.local:
@@ -488,12 +606,84 @@ def _resolve_link(
             raise PlanError(
                 "EventError",
                 f"{source}:{lineno}: local key field '{name}' for '{path}' "
-                f"cannot form a primary key",
+                f"cannot form a scalar key",
             )
         local_values.append(value)
+    return local_values
 
-    target_store = snapshots.get(node.target_table, {})
-    related = target_store.get(tuple(local_values), _MISSING)
+
+def _check_target_fields(
+    node: LinkedField,
+    related: Dict[str, Any],
+    source: str,
+    lineno: int,
+    path: str,
+) -> None:
+    """Ensure every matched target field is present (and scalar) on a snapshot."""
+    for name in node.target:
+        if name not in related:
+            raise PlanError(
+                "EventError",
+                f"{source}:{lineno}: target snapshot is missing key field "
+                f"'{name}' for '{path}'",
+            )
+        if isinstance(related[name], (dict, list)):
+            raise PlanError(
+                "EventError",
+                f"{source}:{lineno}: target key field '{name}' for '{path}' "
+                f"cannot be matched as a scalar",
+            )
+
+
+def _check_primary_key(
+    table: str,
+    key_fields: List[str],
+    related: Dict[str, Any],
+    source: str,
+    lineno: int,
+    path: str,
+) -> None:
+    """Ensure a matched target snapshot supplies its scalar primary key."""
+    for name in key_fields:
+        if name not in related:
+            raise PlanError(
+                "EventError",
+                f"{source}:{lineno}: target snapshot of entity '{table}' for "
+                f"'{path}' is missing primary key field '{name}'",
+            )
+        if isinstance(related[name], (dict, list)):
+            raise PlanError(
+                "EventError",
+                f"{source}:{lineno}: primary key field '{name}' of entity "
+                f"'{table}' for '{path}' cannot be a key",
+            )
+
+
+def _resolve_object(
+    node: LinkedField,
+    snapshot: Dict[str, Any],
+    snapshots: Dict[str, _OrderedStore],
+    source: str,
+    lineno: int,
+    path: str,
+) -> Optional[Dict[str, Any]]:
+    """Follow one single-object @link to the latest target snapshot.
+
+    Returns None when any local key value is null (the relationship itself is
+    absent). Missing local key fields, values that cannot form the target
+    primary key or a target key without a current snapshot end the stream with
+    EventError.
+    """
+    local_values = _read_local(node, snapshot, source, lineno, path)
+    if local_values is None:
+        return None
+
+    target_store = snapshots.get(node.target_table)
+    related = (
+        _MISSING
+        if target_store is None
+        else target_store.rows.get(tuple(local_values), _MISSING)
+    )
     if related is _MISSING:
         rendered = ", ".join(
             f"{name}: {json.dumps(value)}"
@@ -504,14 +694,47 @@ def _resolve_link(
             f"{source}:{lineno}: no current snapshot of entity "
             f"'{node.target_table}' for '{path}' with key {{{rendered}}}",
         )
-    for name in node.target:
-        if name not in related:
-            raise PlanError(
-                "EventError",
-                f"{source}:{lineno}: target snapshot is missing key field "
-                f"'{name}' for '{path}'",
-            )
+    _check_target_fields(node, related, source, lineno, path)
     return related
+
+
+def _resolve_list(
+    node: LinkedField,
+    snapshot: Dict[str, Any],
+    snapshots: Dict[str, _OrderedStore],
+    entity_keys: Dict[str, List[str]],
+    source: str,
+    lineno: int,
+    path: str,
+) -> List[Dict[str, Any]]:
+    """Match all current target snapshots for a list @link, in insert order.
+
+    An empty list stands for both an absent relationship (any local value
+    null) and a relationship without a current match. Local key fields that
+    are missing or non-scalar, and matched target snapshots that lack a target
+    field or a usable primary key, end the stream with EventError.
+    """
+    local_values = _read_local(node, snapshot, source, lineno, path)
+    if local_values is None:
+        return []
+
+    target_store = snapshots.get(node.target_table)
+    if target_store is None:
+        return []
+    pk_fields = entity_keys[node.target_table]
+    expected = tuple(local_values)
+    matches: List[Dict[str, Any]] = []
+    candidates = list(target_store.rows.values()) + list(target_store.keyless)
+    for related in candidates:
+        _check_target_fields(node, related, source, lineno, path)
+        values = tuple(related[name] for name in node.target)
+        if values != expected or None in values:
+            continue
+        _check_primary_key(
+            node.target_table, pk_fields, related, source, lineno, path
+        )
+        matches.append(related)
+    return matches
 
 
 def _parse_event(line: str, source: str, lineno: int) -> Dict[str, Any]:
