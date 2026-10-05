@@ -148,6 +148,38 @@ NESTED_EVENTS = "\n".join([
 ]) + "\n"
 
 
+LIST_SCHEMA = """\
+type Query {
+  users: [User!]!
+}
+
+type Subscription {
+  users: [User!]!
+  teams: [Team!]!
+}
+
+type User @entity(name: "users", key: "id") {
+  id: ID!
+  name: String!
+  team_id: ID
+  team: Team @link(local: "team_id", target: "id")
+  mates: [User!]! @link(local: "team_id", target: "team_id")
+}
+
+type Team @entity(name: "teams", key: "id") {
+  id: ID!
+  name: String!
+  members: [User!]! @link(local: "id", target: "team_id")
+}
+"""
+
+LIST_EVENTS = "\n".join([
+    _event("INSERT", "users", None, {"id": 1, "name": "ada", "team_id": 9}),
+    _event("INSERT", "users", None, {"id": 2, "name": "bob", "team_id": 9}),
+    _event("INSERT", "users", None, {"id": 3, "name": "cy", "team_id": 7}),
+]) + "\n"
+
+
 
 class CliCase(unittest.TestCase):
     def setUp(self):
@@ -304,17 +336,6 @@ class CliCase(unittest.TestCase):
     def test_leaf_with_selection(self):
         self.assert_error(
             *self.run_cli("subscription { users { id { x } } }"), "InvalidQuery"
-        )
-
-    def test_list_relationship_unsupported(self):
-        schema = SCHEMA + (
-            'extend type User { mates: [User!]! '
-            '@link(local: "team_id", target: "team_id") }\n'
-        )
-        self.assert_error(
-            *self.run_cli("subscription { users { id mates { id } } }",
-                          schema=schema),
-            "UnsupportedSelection",
         )
 
     def test_unknown_argument(self):
@@ -700,6 +721,193 @@ class CliCase(unittest.TestCase):
             )
         )
         self.assertEqual(rows[0]["data"], {"id": "x1", "token": None})
+
+    # -- list relationships ------------------------------------------------------
+
+    def test_list_relationship_matches_current_snapshots(self):
+        rows = self.assert_rows(*self.run_cli(
+            "subscription { users { id mates { id name } } }",
+            schema=LIST_SCHEMA, events=LIST_EVENTS,
+        ))
+        self.assertEqual([r["event"] for r in rows], ["INSERT"] * 3)
+        # the target of a list link need not be the target primary key
+        self.assertEqual(rows[0]["data"],
+                         {"id": 1, "mates": [{"id": 1, "name": "ada"}]})
+        self.assertEqual(rows[1]["data"],
+                         {"id": 2, "mates": [{"id": 1, "name": "ada"},
+                                             {"id": 2, "name": "bob"}]})
+        self.assertEqual(rows[2]["data"],
+                         {"id": 3, "mates": [{"id": 3, "name": "cy"}]})
+
+    def test_list_relationship_empty_when_nothing_matches(self):
+        events = "\n".join([
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "team_id": 7}),
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+        ]) + "\n"
+        rows = self.assert_rows(*self.run_cli(
+            "subscription { teams { id members { id } } }",
+            schema=LIST_SCHEMA, events=events,
+        ))
+        self.assertEqual(rows[0]["data"], {"id": 9, "members": []})
+
+    def test_list_relationship_empty_when_local_is_null(self):
+        events = _event(
+            "INSERT", "users", None, {"id": 1, "name": "ada", "team_id": None}
+        ) + "\n"
+        rows = self.assert_rows(*self.run_cli(
+            "subscription { users { id mates { id } } }",
+            schema=LIST_SCHEMA, events=events,
+        ))
+        self.assertEqual(rows[0]["data"], {"id": 1, "mates": []})
+
+    def test_list_relationship_ordering_rules(self):
+        events = "\n".join([
+            _event("INSERT", "users", None, {"id": 1, "name": "a", "team_id": 9}),
+            _event("INSERT", "users", None, {"id": 2, "name": "b", "team_id": 9}),
+            _event("INSERT", "users", None, {"id": 3, "name": "c", "team_id": 9}),
+            _event("UPDATE", "users",
+                   {"id": 2, "name": "b", "team_id": 9},
+                   {"id": 2, "name": "b2", "team_id": 9}),
+            _event("DELETE", "users", {"id": 1, "name": "a", "team_id": 9}, None),
+            _event("INSERT", "users", None, {"id": 1, "name": "a2", "team_id": 9}),
+        ]) + "\n"
+        rows = self.assert_rows(*self.run_cli(
+            "subscription { users { id mates { id } } }",
+            schema=LIST_SCHEMA, events=events,
+        ))
+        mate_ids = [[m["id"] for m in row["data"]["mates"]] for row in rows]
+        # UPDATE keeps the target's position
+        self.assertEqual(mate_ids[3], [1, 2, 3])
+        # DELETE removes the target
+        self.assertEqual(mate_ids[4], [2, 3])
+        # re-INSERT after DELETE sorts last
+        self.assertEqual(mate_ids[5], [2, 3, 1])
+
+    def test_list_relationship_with_alias_and_fragment(self):
+        subscription = """
+        subscription {
+          users { id pals: mates { mateId: id ...UserBits } }
+        }
+        fragment UserBits on User { name }
+        """
+        rows = self.assert_rows(*self.run_cli(
+            subscription, schema=LIST_SCHEMA, events=LIST_EVENTS
+        ))
+        self.assertEqual(rows[0]["data"],
+                         {"id": 1, "pals": [{"mateId": 1, "name": "ada"}]})
+
+    def test_list_relationship_nested_under_object(self):
+        events = "\n".join([
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "team_id": 9}),
+            _event("INSERT", "users", None,
+                   {"id": 2, "name": "bob", "team_id": 9}),
+        ]) + "\n"
+        rows = self.assert_rows(*self.run_cli(
+            "subscription { users { id team { name members { id } } } }",
+            schema=LIST_SCHEMA, events=events,
+        ))
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": 1, "team": {"name": "core", "members": [{"id": 1}]}},
+        )
+        self.assertEqual(
+            rows[1]["data"],
+            {"id": 2, "team": {"name": "core",
+                               "members": [{"id": 1}, {"id": 2}]}},
+        )
+
+    def test_list_relationship_with_composite_link(self):
+        schema = COMPOSITE_SCHEMA + (
+            "extend type Token { transfers: [Transfer!]! "
+            '@link(local: ["chain_id", "id"], '
+            'target: ["token_chain", "token_id"]) }\n'
+        )
+        events = "\n".join([
+            _event("INSERT", "tokens", None,
+                   {"chain_id": 1, "id": "t1", "symbol": "T"}),
+            _event("INSERT", "transfers", None,
+                   {"chain_id": 1, "id": "x1",
+                    "token_chain": 1, "token_id": "t1"}),
+            _event("INSERT", "transfers", None,
+                   {"chain_id": 2, "id": "x2",
+                    "token_chain": 1, "token_id": "t1"}),
+            _event("INSERT", "transfers", None,
+                   {"chain_id": 3, "id": "x3",
+                    "token_chain": None, "token_id": None}),
+        ]) + "\n"
+        subscription = (
+            "subscription { transfers { id token { symbol transfers { id } } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=schema, events=events)
+        )
+        self.assertEqual(
+            rows[0]["data"],
+            {"id": "x1",
+             "token": {"symbol": "T", "transfers": [{"id": "x1"}]}},
+        )
+        self.assertEqual(
+            rows[1]["data"],
+            {"id": "x2",
+             "token": {"symbol": "T", "transfers": [{"id": "x1"}, {"id": "x2"}]}},
+        )
+        self.assertEqual(rows[2]["data"], {"id": "x3", "token": None})
+
+    def test_list_local_field_missing_is_event_error(self):
+        events = _event("INSERT", "users", None, {"id": 1, "name": "ada"}) + "\n"
+        self.assert_error(
+            *self.run_cli("subscription { users { id mates { id } } }",
+                          schema=LIST_SCHEMA, events=events),
+            "EventError",
+        )
+
+    def test_list_local_non_scalar_is_event_error(self):
+        events = _event(
+            "INSERT", "users", None,
+            {"id": 1, "name": "ada", "team_id": ["x"]},
+        ) + "\n"
+        self.assert_error(
+            *self.run_cli("subscription { users { id mates { id } } }",
+                          schema=LIST_SCHEMA, events=events),
+            "EventError",
+        )
+
+    def test_list_target_snapshot_missing_target_field_is_event_error(self):
+        events = "\n".join([
+            _event("INSERT", "users", None, {"id": 1, "name": "ada"}),
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+        ]) + "\n"
+        self.assert_error(
+            *self.run_cli("subscription { teams { id members { id } } }",
+                          schema=LIST_SCHEMA, events=events),
+            "EventError",
+        )
+
+    def test_list_link_missing_link_is_mapping_error(self):
+        schema = LIST_SCHEMA.replace(
+            ' mates: [User!]! @link(local: "team_id", target: "team_id")',
+            " mates: [User!]!",
+        )
+        self.assert_error(
+            *self.run_cli("subscription { users { id mates { id } } }",
+                          schema=schema),
+            "MappingError",
+        )
+
+    def test_list_target_not_entity_is_unknown_entity(self):
+        schema = LIST_SCHEMA + (
+            'extend type User { profiles: [Profile!]! '
+            '@link(local: "team_id", target: "id") }\n'
+            "type Profile { id: ID! }\n"
+        )
+        self.assert_error(
+            *self.run_cli("subscription { users { id profiles { id } } }",
+                          schema=schema),
+            "UnknownEntity",
+        )
 
     # -- nested selection compile errors -------------------------------------------
 

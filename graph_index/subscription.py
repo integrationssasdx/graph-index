@@ -4,8 +4,11 @@ Compiles a subscription operation into an equality filter plus a field
 projection over a single @entity root, then applies it to an NDJSON stream of
 entity change events. GraphQL, variable and @entity mapping semantics are
 shared with the query planner; the supported selection shape covers leaf
-fields and nested object fields reached through @link joins (one or more
-levels deep, including aliases and fragment spreads).
+fields, nested object fields and list relationship fields reached through
+@link joins (one or more levels deep, including aliases and fragment
+spreads). List relationships match every current target snapshot whose
+@link target values equal the source's local values; unlike single-object
+links, their target fields need not form the target primary key.
 """
 
 from __future__ import annotations
@@ -69,7 +72,9 @@ class LinkedField:
 
     Leaf fields carry ``field_name`` and no children. Link fields carry the
     validated @link mapping (local/target field names, target entity) and a
-    list of compiled children.
+    list of compiled children; ``is_list`` marks fields whose type is a list
+    of objects, which match every current target snapshot by equality and
+    project to an array.
     """
 
     __slots__ = (
@@ -79,6 +84,7 @@ class LinkedField:
         "local",
         "target",
         "target_table",
+        "is_list",
         "children",
     )
 
@@ -90,14 +96,16 @@ class LinkedField:
         local: Optional[List[str]] = None,
         target: Optional[List[str]] = None,
         target_table: Optional[str] = None,
+        is_list: bool = False,
         children: Optional[List["LinkedField"]] = None,
     ):
         self.response_key = response_key
         self.field_name = field_name
         self.required = required  # field declared as a non-null object type
         self.local = local  # source-side key field names, in @link order
-        self.target = target  # target primary key field names, in @link order
+        self.target = target  # target-side field names, in @link order
         self.target_table = target_table
+        self.is_list = is_list  # field type is a list of objects
         self.children = children
 
 
@@ -267,12 +275,8 @@ class SubscriptionCompiler(Planner):
                 raise PlanError(
                     "InvalidQuery", f"field '{node.name}' requires a selection set"
                 )
-            if _is_list_type(field.type_ref):
-                raise PlanError(
-                    "UnsupportedSelection",
-                    f"list relationship '{node.name}' is not supported in subscriptions",
-                )
-            required = field.type_ref[0] == "non_null"
+            is_list = _is_list_type(field.type_ref)
+            required = not is_list and field.type_ref[0] == "non_null"
             if field.link is None:
                 raise PlanError(
                     "MappingError",
@@ -291,7 +295,7 @@ class SubscriptionCompiler(Planner):
                     f"type '{target_info.name}' is not mapped to an entity",
                 )
             local, target_key, _as_array = field.link
-            if target_key != target_entity.key:
+            if not is_list and target_key != target_entity.key:
                 raise PlanError(
                     "InvalidJoin",
                     f"@link target {target_key} does not match the primary key of "
@@ -315,6 +319,7 @@ class SubscriptionCompiler(Planner):
                         local=list(local),
                         target=list(target_key),
                         target_table=target_entity.table,
+                        is_list=is_list,
                         children=nested,
                     )
                 )
@@ -442,6 +447,15 @@ def _project(
                 )
             data[node.response_key] = snapshot[node.field_name]
             continue
+        if node.is_list:
+            matched = _resolve_list_link(
+                node, snapshot, snapshots, source, lineno, node_path
+            )
+            data[node.response_key] = [
+                _project(node.children, item, snapshots, source, lineno, node_path)
+                for item in matched
+            ]
+            continue
         related = _resolve_link(node, snapshot, snapshots, source, lineno, node_path)
         if related is None:
             if node.required:
@@ -512,6 +526,60 @@ def _resolve_link(
                 f"'{name}' for '{path}'",
             )
     return related
+
+
+def _resolve_list_link(
+    node: LinkedField,
+    snapshot: Dict[str, Any],
+    snapshots: Dict[str, Dict[Tuple[Any, ...], Dict[str, Any]]],
+    source: str,
+    lineno: int,
+    path: str,
+) -> List[Dict[str, Any]]:
+    """Collect every current target snapshot matching one list @link.
+
+    Matching is equality between the source's local values and each target
+    snapshot's target values; the target fields need not be the target
+    primary key. Returns matches in the order the targets first entered the
+    snapshot store (an UPDATE keeps its position, a re-INSERT after DELETE
+    sorts last). Any null local value means the empty list. Missing local
+    key fields, local values that cannot form a scalar key and target
+    snapshots missing a target field end the stream with EventError.
+    """
+    local_values: List[Any] = []
+    for name in node.local:
+        if name not in snapshot:
+            raise PlanError(
+                "EventError",
+                f"{source}:{lineno}: snapshot is missing local key field "
+                f"'{name}' for '{path}'",
+            )
+        value = snapshot[name]
+        if value is None:
+            return []
+        if isinstance(value, (dict, list)):
+            raise PlanError(
+                "EventError",
+                f"{source}:{lineno}: local key field '{name}' for '{path}' "
+                f"cannot form a scalar key",
+            )
+        local_values.append(value)
+
+    matched: List[Dict[str, Any]] = []
+    target_store = snapshots.get(node.target_table, {})
+    for related in target_store.values():
+        target_values: List[Any] = []
+        for name in node.target:
+            if name not in related:
+                raise PlanError(
+                    "EventError",
+                    f"{source}:{lineno}: target snapshot is missing target field "
+                    f"'{name}' for '{path}'",
+                )
+            target_values.append(related[name])
+        if target_values == local_values:
+            matched.append(related)
+    return matched
 
 
 def _parse_event(line: str, source: str, lineno: int) -> Dict[str, Any]:
