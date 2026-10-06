@@ -19,8 +19,8 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import PlanError
-from .gql import parse_executable
-from .planner import Planner
+from .gql import Var, parse_executable
+from .planner import Planner, _is_list_type
 from .schema import Entity, TypeInfo, named_of
 
 EVENT_OPS = ("INSERT", "UPDATE", "DELETE")
@@ -112,6 +112,9 @@ class LinkedField:
 
 class SubscriptionCompiler(Planner):
     """Reuses the planner's fragment expansion and variable resolution."""
+
+    def __init__(self, schema, variables, bound_args_allowed: bool = False):
+        super().__init__(schema, variables, bound_args_allowed)
 
     def compile(
         self, subscription_text: str, source: str, operation_name: Optional[str]
@@ -209,8 +212,16 @@ class SubscriptionCompiler(Planner):
                     "InvalidQuery",
                     f"missing required argument '{arg_name}' on root field '{node.name}'",
                 )
+        is_list = _is_list_type(field.type_ref)
         filter_obj: Dict[str, Any] = {}
         for arg_name, value in node.args.items():
+            if self._accepts_bound_arg(is_list, arg_name):
+                # A list-size bound used for complexity; never a filter. If it
+                # is a variable, resolve it so type/required-variable errors
+                # are reported by the normal validation phase.
+                if isinstance(value, Var):
+                    self._resolve(value)
+                continue
             if arg_name not in field.args:
                 raise PlanError(
                     "InvalidQuery",
@@ -267,7 +278,12 @@ class SubscriptionCompiler(Planner):
                     seen.add(key)
                     children.append(LinkedField(key, node.name))
                 continue
-            if node.args:
+            is_list = _is_list_type(field.type_ref)
+            for arg_name, value in node.args.items():
+                if self._accepts_bound_arg(is_list, arg_name):
+                    if isinstance(value, Var):
+                        self._resolve(value)
+                    continue
                 raise PlanError(
                     "InvalidQuery",
                     f"arguments on field '{node.name}' are not supported",
@@ -276,7 +292,6 @@ class SubscriptionCompiler(Planner):
                 raise PlanError(
                     "InvalidQuery", f"field '{node.name}' requires a selection set"
                 )
-            is_list = _is_list_type(field.type_ref)
             required = field.type_ref[0] == "non_null"
             if field.link is None:
                 raise PlanError(
@@ -351,13 +366,6 @@ class SubscriptionCompiler(Planner):
                     )
                 )
         return children
-
-
-def _is_list_type(type_ref) -> bool:
-    """Whether a (possibly non-null wrapped) field type is a list."""
-    if type_ref[0] == "non_null":
-        type_ref = type_ref[1]
-    return type_ref[0] == "list"
 
 
 def _is_scalar_value_field(schema, field) -> bool:

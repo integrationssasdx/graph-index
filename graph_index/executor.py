@@ -18,7 +18,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import PlanError
-from .gql import parse_executable
+from .gql import Var, parse_executable
 from .planner import Planner
 from .schema import Entity, Schema, TypeInfo, named_of
 from .subscription import EVENT_OPS, _OrderedStore, _is_list_type
@@ -92,8 +92,9 @@ class ExecContext:
 class QueryCompiler(Planner):
     """Compiles a query document into one executable entry per root field."""
 
-    def __init__(self, schema: Schema, variables: Dict[str, Any]):
-        super().__init__(schema, variables)
+    def __init__(self, schema: Schema, variables: Dict[str, Any],
+                 bound_args_allowed: bool = False):
+        super().__init__(schema, variables, bound_args_allowed)
         self.entity_keys: Dict[str, List[str]] = {}
         self.key_types: Dict[str, List[Any]] = {}
 
@@ -131,6 +132,12 @@ class QueryCompiler(Planner):
         self.entity_keys = {}
         self.key_types = {}
         for node in selections:
+            # Introspection root fields cost 0 and are only recognized while
+            # complexity control is enabled; the engine models no introspection
+            # data, so such a root resolves deterministically to null.
+            if self.bound_args_allowed and node.name in ("__schema", "__type"):
+                roots.append({"introspection": node.alias or node.name})
+                continue
             roots.append(self._compile_root(node, root_type))
         return op.name, roots
 
@@ -184,9 +191,17 @@ class QueryCompiler(Planner):
                     "UnknownField",
                     f"missing required argument '{arg_name}' on root field '{node.name}'",
                 )
+        is_list = _is_list_type(field.type_ref)
         filter_obj: Dict[str, Any] = {}
         filter_types: Dict[str, Any] = {}
         for arg_name, value in node.args.items():
+            if self._accepts_bound_arg(is_list, arg_name):
+                # A list-size bound used for complexity; never a filter. If it
+                # is a variable, resolve it so type/required-variable errors
+                # are reported by the normal validation phase.
+                if isinstance(value, Var):
+                    self._resolve(value)
+                continue
             if arg_name not in field.args:
                 raise PlanError(
                     "UnknownField",
@@ -204,7 +219,6 @@ class QueryCompiler(Planner):
             filter_obj[arg_name] = self._resolve(value)
             filter_types[arg_name] = target_field.type_ref
 
-        is_list = _is_list_type(field.type_ref)
         self.entity_keys[entity.table] = list(entity.key)
         self.key_types[entity.table] = [
             target.fields[name].type_ref for name in entity.key
@@ -260,7 +274,12 @@ class QueryCompiler(Planner):
                     seen.add(key)
                     children.append(ExecNode(key, node.name, field.type_ref))
                 continue
-            if node.args:
+            is_list = _is_list_type(field.type_ref)
+            for arg_name, value in node.args.items():
+                if self._accepts_bound_arg(is_list, arg_name):
+                    if isinstance(value, Var):
+                        self._resolve(value)
+                    continue
                 raise PlanError(
                     "InvalidQuery",
                     f"arguments on field '{node.name}' are not supported",
@@ -269,7 +288,6 @@ class QueryCompiler(Planner):
                 raise PlanError(
                     "InvalidQuery", f"field '{node.name}' requires a selection set"
                 )
-            is_list = _is_list_type(field.type_ref)
             required = field.type_ref[0] == "non_null"
             if field.link is None:
                 raise PlanError(
@@ -480,6 +498,11 @@ def execute(roots: List[dict], ctx: ExecContext) -> Dict[str, Any]:
     """Answer the compiled query against the current snapshot stores."""
     data: Dict[str, Any] = {}
     for root in roots:
+        if "introspection" in root:
+            # No introspection data is modeled; a cost-0 introspection root is
+            # answered deterministically with null.
+            data[root["introspection"]] = None
+            continue
         data[root["response_key"]] = _execute_root(root, ctx)
     return {"data": data}
 

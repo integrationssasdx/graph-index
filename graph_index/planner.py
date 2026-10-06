@@ -19,14 +19,46 @@ from .gql import (
 )
 from .schema import Schema, TypeInfo, named_of
 
+# Field arguments accepted as list-size bounds while query complexity control
+# is enabled, in priority order. Only present when a bound limit is configured,
+# so baseline argument validation is unchanged when the control is off.
+BOUND_ARG_NAMES = ("first", "limit")
+
+
+def _is_list_type(type_ref) -> bool:
+    """Whether a (possibly non-null wrapped) field type is a list."""
+    if type_ref[0] == "non_null":
+        type_ref = type_ref[1]
+    return type_ref[0] == "list"
+
 
 class Planner:
-    def __init__(self, schema: Schema, variables: Dict[str, Any]):
+    def __init__(self, schema: Schema, variables: Dict[str, Any],
+                 bound_args_allowed: bool = False):
         self.schema = schema
         self.variables = variables
+        # When a complexity limit is configured, list fields accept first/limit
+        # bounds (literal or variable); otherwise arguments stay unsupported.
+        self.bound_args_allowed = bound_args_allowed
         self.fragments: Dict[str, Any] = {}
         self.var_map: Dict[str, tuple] = {}
         self.joins: List[dict] = []
+
+    # -- complexity bound arguments ------------------------------------------
+
+    def _accepts_bound_arg(self, is_list_field: bool, arg_name: str) -> bool:
+        """Whether a first/limit argument is accepted on this field.
+
+        Bound arguments are only recognized while complexity control is
+        enabled and only on list-returning fields; everywhere else the field's
+        ordinary argument validation (unknown argument / arguments not
+        supported) keeps applying, so baseline behavior is unchanged.
+        """
+        return (
+            self.bound_args_allowed
+            and is_list_field
+            and arg_name in BOUND_ARG_NAMES
+        )
 
     # -- entry point ---------------------------------------------------------
 
