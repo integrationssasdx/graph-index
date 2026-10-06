@@ -87,6 +87,7 @@ class LinkedField:
         "target",
         "target_table",
         "children",
+        "type_ref",
     )
 
     def __init__(
@@ -99,6 +100,7 @@ class LinkedField:
         target: Optional[List[str]] = None,
         target_table: Optional[str] = None,
         children: Optional[List["LinkedField"]] = None,
+        type_ref=None,
     ):
         self.response_key = response_key
         self.field_name = field_name
@@ -108,6 +110,7 @@ class LinkedField:
         self.target = target  # target-side matched field names, in @link order
         self.target_table = target_table
         self.children = children
+        self.type_ref = type_ref  # declared field type, for shape validation
 
 
 class SubscriptionCompiler(Planner):
@@ -265,7 +268,9 @@ class SubscriptionCompiler(Planner):
                     )
                 if key not in seen:
                     seen.add(key)
-                    children.append(LinkedField(key, node.name))
+                    children.append(
+                        LinkedField(key, node.name, type_ref=field.type_ref)
+                    )
                 continue
             if node.args:
                 raise PlanError(
@@ -348,6 +353,7 @@ class SubscriptionCompiler(Planner):
                         target=list(target_key),
                         target_table=target_entity.table,
                         children=nested,
+                        type_ref=field.type_ref,
                     )
                 )
         return children
