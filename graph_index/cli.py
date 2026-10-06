@@ -7,6 +7,7 @@ import json
 import sys
 
 from .errors import PlanError
+from .executor import ExecContext, QueryCompiler, execute, fold_events
 from .planner import Planner
 from .schema import load_schema
 from .subscription import SubscriptionCompiler, push_events
@@ -63,6 +64,24 @@ def _cmd_subscription_push(args) -> list:
     return push_events(plan, events_text, args.events)
 
 
+def _cmd_query_exec(args) -> dict:
+    schema_text = _read_text_file(args.schema)
+    query_text = _read_text_file(args.query)
+    variables_text = _read_text_file(args.variables)
+    events_text = _read_text_file(args.events)
+
+    schema = load_schema(schema_text, args.schema)
+    variables = _load_variables(variables_text, args.variables)
+
+    compiler = QueryCompiler(schema, variables)
+    _operation_name, roots = compiler.compile(
+        query_text, args.query, args.operation
+    )
+    ctx = ExecContext(schema, compiler.entity_keys, compiler.key_types)
+    fold_events(ctx, events_text, args.events)
+    return execute(roots, ctx)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="graph-index",
@@ -101,6 +120,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="operation name to select when the document has several",
     )
+    query_exec = sub.add_parser(
+        "query-exec",
+        help="execute a GraphQL query over entity change events",
+    )
+    query_exec.add_argument(
+        "--schema", required=True, help="GraphQL schema file (SDL)"
+    )
+    query_exec.add_argument("--query", required=True, help="GraphQL query file")
+    query_exec.add_argument(
+        "--variables", required=True, help="variables JSON file"
+    )
+    query_exec.add_argument(
+        "--events", required=True, help="entity change events file (NDJSON)"
+    )
+    query_exec.add_argument(
+        "--operation",
+        default=None,
+        help="operation name to select when the document has several",
+    )
     return parser
 
 
@@ -114,6 +152,10 @@ def main(argv=None) -> int:
         if args.command == "subscription-push":
             for row in _cmd_subscription_push(args):
                 sys.stdout.write(json.dumps(row, ensure_ascii=False) + "\n")
+            return 0
+        if args.command == "query-exec":
+            result = _cmd_query_exec(args)
+            sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
             return 0
         raise PlanError("InvalidRequest", f"unknown command '{args.command}'")
     except PlanError as exc:
