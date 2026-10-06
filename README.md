@@ -12,6 +12,17 @@
 - `graph-index subscription-push --schema <schema.graphql> --subscription <subscription.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：将订阅编译为实体等值过滤与字段投影（支持叶字段以及经 @link 到达的一层或多层嵌套对象字段与嵌套列表字段，含别名与片段展开），按序匹配 NDJSON 实体变更事件（INSERT/UPDATE/DELETE）。处理时先逐行解析校验，再按实体主键维护各实体最新快照（INSERT/UPDATE 保存 after，DELETE 删除 before 对应实体）；对象字段按 @link 的 local→target 顺序从截至当前行的最新目标快照取单个对象，任一 local 为 null 时关系为 null（非空对象字段则以 EventError 结束）；列表字段将目标表当前快照中 target 值与源 local 值等值匹配的实体全部收集，按目标首次 INSERT/UPDATE 入库的顺序排列（UPDATE 原位替换，DELETE 后重新 INSERT 排到末尾），任一 local 为 null 或无匹配时输出空数组，列表 @link 的 target 不必是目标实体主键（但 local/target 字段均须为标量）。成功时向 stdout 输出 JSONL（字段：`subscription`、`path`、`event`、`entity`、`data`），失败时向 stderr 输出 `{code, message}` 并以退出码 2 结束（stdout 不输出部分结果）。
 - `graph-index query-exec --schema <schema.graphql> --query <query.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：对实体变更快照直接执行一次 GraphQL 查询。事件先逐行解析校验，再按 INSERT、UPDATE、DELETE 顺序维护各查询可达实体的主键当前快照（INSERT/UPDATE 保存 after，DELETE 按 before 移除）；只执行 query，mutation/subscription 以 `UnsupportedOperation` 结束。根参数按映射实体标量字段等值过滤：列表根返回全部匹配行（快照首次入库顺序，UPDATE 原位替换，DELETE 后重插排末尾），单实体根零匹配返回 `null`、多匹配以 `QueryError` 结束。单对象 @link 的 local 按声明顺序指向目标实体主键：任一 local 为 null 时关系为 null（字段非空则 `EventError`），local 非 null 而目标不存在亦为 `EventError`；列表 @link 以 local 与 target 标量值等值匹配（target 无须是主键），无匹配或 local 含 null 返回空数组，并按目标首次入库顺序排列。别名、变量默认值、片段展开与复合主键沿用 query-plan 语义。事件结构、op、before/after、实体主键或投影快照（含字段值与 schema 声明形状不兼容）不合约定以 `EventError` 结束；GraphQL、变量、映射与连接声明的非法输入沿用既有错误码。成功时向 stdout 输出一次 GraphQL 响应（顶层 `data`），失败时向 stderr 输出单个 `{code, message}` 并以退出码 2 结束（stdout 无部分结果）。
 
+## 查询复杂度控制
+
+环境变量 `GRAPHQL_QUERY_COMPLEXITY_LIMIT` 在服务启动时读取一次，在真正执行解析器、读取索引实体或建立订阅之前按同一份 GraphQL 文档与变量计算单次 operation 的复杂度：
+
+- 变量缺省或值为 `0` 时功能关闭；正整数为单次 operation 的复杂度上限；负数、非整数或无法解析的值使启动失败，不开放监听端口，向 stderr 输出唯一诊断码 `INVALID_QUERY_COMPLEXITY_LIMIT`（退出码 2）。
+- 复杂度从所选 operation 的根 selection set 开始计算：每个叶子字段计 1，组合字段只累计其子 selection；重复字段与不同 alias 分别计算（不做响应键合并）；fragment 按定义在展开位置展开一次，未被选中的 operation 及其不可达 fragment 不计入；内省字段 `__schema`、`__type` 连同其子 selection 计 0。
+- 列表字段按有效条目上界放大子 selection：优先取字段参数 `first`，其次 `limit`，接受正整数字面量或正整数变量值；参数缺失、非正、非整数（含 `true`/字符串/浮点）时按 1000 计。变量本身的 GraphQL 类型校验仍由既有校验阶段处理（类型不符为 `VariablesError`）。`first`/`limit` 只参与计费，不改变过滤、返回实体、数据结构或顺序。
+- 复杂度等于上限允许执行；大于上限时确定地停止：不调用解析器、不读取索引实体、不建立订阅，也不产生持久化副作用（事件流在计费通过后才会读取）。query-exec / subscription-push 在 stdout 输出单个 GraphQL 响应，`data` 为 `null`，`errors` 恰有一个且 `extensions.code` 为 `QUERY_COMPLEXITY_EXCEEDED`，退出码 0。
+- 畸形文档、变量类型错误、未知字段、fragment 循环等继续返回既有 GraphQL 校验错误（退出码 2），不改写为复杂度错误。同一请求内查询计划的分批取数不重复收费；订阅仅在建立前计费一次，建立后的推送数据不再计费。query-plan 命令不执行该门禁。
+
+
 ## 约定
 
 - 公开行为以 README 与源码为准。

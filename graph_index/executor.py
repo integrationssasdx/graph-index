@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import PlanError
 from .gql import parse_executable
+from .complexity import BOUND_ARGUMENTS, resolve_bound_argument
 from .planner import Planner
 from .schema import Entity, Schema, TypeInfo, named_of
 from .subscription import EVENT_OPS, _OrderedStore, _is_list_type
@@ -99,7 +100,7 @@ class QueryCompiler(Planner):
 
     def compile(
         self, query_text: str, source: str, operation_name: Optional[str]
-    ) -> Tuple[Optional[str], List[dict]]:
+    ) -> Tuple[Any, List[dict]]:
         operations, self.fragments = parse_executable(query_text, source)
         op = self._select_operation(operations, operation_name)
         if op.op_type != "query":
@@ -132,7 +133,7 @@ class QueryCompiler(Planner):
         self.key_types = {}
         for node in selections:
             roots.append(self._compile_root(node, root_type))
-        return op.name, roots
+        return op, roots
 
     # -- operation selection ---------------------------------------------------
 
@@ -186,7 +187,16 @@ class QueryCompiler(Planner):
                 )
         filter_obj: Dict[str, Any] = {}
         filter_types: Dict[str, Any] = {}
+        is_list = _is_list_type(field.type_ref)
         for arg_name, value in node.args.items():
+            if arg_name in BOUND_ARGUMENTS and is_list:
+                # On list fields first/limit only bound the complexity and
+                # never affect the entities returned; they still undergo the
+                # ordinary variable validation.
+                resolve_bound_argument(
+                    value, self.var_map, self.variables, self._check_type
+                )
+                continue
             if arg_name not in field.args:
                 raise PlanError(
                     "UnknownField",
@@ -204,7 +214,6 @@ class QueryCompiler(Planner):
             filter_obj[arg_name] = self._resolve(value)
             filter_types[arg_name] = target_field.type_ref
 
-        is_list = _is_list_type(field.type_ref)
         self.entity_keys[entity.table] = list(entity.key)
         self.key_types[entity.table] = [
             target.fields[name].type_ref for name in entity.key
@@ -260,16 +269,23 @@ class QueryCompiler(Planner):
                     seen.add(key)
                     children.append(ExecNode(key, node.name, field.type_ref))
                 continue
-            if node.args:
-                raise PlanError(
-                    "InvalidQuery",
-                    f"arguments on field '{node.name}' are not supported",
-                )
             if node.selection_set is None:
                 raise PlanError(
                     "InvalidQuery", f"field '{node.name}' requires a selection set"
                 )
             is_list = _is_list_type(field.type_ref)
+            for arg_name, value in node.args.items():
+                if arg_name in BOUND_ARGUMENTS and is_list:
+                    # first/limit on list fields only bound complexity and
+                    # never change the resolved entities.
+                    resolve_bound_argument(
+                        value, self.var_map, self.variables, self._check_type
+                    )
+                    continue
+                raise PlanError(
+                    "InvalidQuery",
+                    f"arguments on field '{node.name}' are not supported",
+                )
             required = field.type_ref[0] == "non_null"
             if field.link is None:
                 raise PlanError(

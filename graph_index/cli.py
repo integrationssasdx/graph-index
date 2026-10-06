@@ -7,6 +7,11 @@ import json
 import sys
 
 from .errors import PlanError
+from .complexity import (
+    QueryComplexityExceeded,
+    limit_enabled,
+    load_complexity_limit,
+)
 from .executor import ExecContext, QueryCompiler, execute, fold_events
 from .planner import Planner
 from .schema import load_schema
@@ -50,36 +55,62 @@ def _cmd_query_plan(args) -> dict:
     return planner.plan(query_text, args.query, args.operation)
 
 
-def _cmd_subscription_push(args) -> list:
+def _cmd_subscription_push(args, complexity_limit) -> list:
     schema_text = _read_text_file(args.schema)
     subscription_text = _read_text_file(args.subscription)
     variables_text = _read_text_file(args.variables)
-    events_text = _read_text_file(args.events)
 
     schema = load_schema(schema_text, args.schema)
     variables = _load_variables(variables_text, args.variables)
 
     compiler = SubscriptionCompiler(schema, variables)
     plan = compiler.compile(subscription_text, args.subscription, args.operation)
+    _enforce_complexity(compiler, schema, variables, complexity_limit)
+    # The subscription is established only after the gate passes; events are
+    # read and matched from this point on.
+    events_text = _read_text_file(args.events)
     return push_events(plan, events_text, args.events)
 
 
-def _cmd_query_exec(args) -> dict:
+def _cmd_query_exec(args, complexity_limit) -> dict:
     schema_text = _read_text_file(args.schema)
     query_text = _read_text_file(args.query)
     variables_text = _read_text_file(args.variables)
-    events_text = _read_text_file(args.events)
 
     schema = load_schema(schema_text, args.schema)
     variables = _load_variables(variables_text, args.variables)
 
     compiler = QueryCompiler(schema, variables)
-    _operation_name, roots = compiler.compile(
-        query_text, args.query, args.operation
-    )
+    op, roots = compiler.compile(query_text, args.query, args.operation)
+    _enforce_complexity(compiler, schema, variables, complexity_limit, op)
+    # Parsers must not run and indexed entities must not be read until the
+    # request passes the complexity gate.
+    events_text = _read_text_file(args.events)
     ctx = ExecContext(schema, compiler.entity_keys, compiler.key_types)
     fold_events(ctx, events_text, args.events)
     return execute(roots, ctx)
+
+
+def _enforce_complexity(compiler, schema, variables, complexity_limit, op=None) -> None:
+    """Stop deterministically when the selected operation is over budget."""
+    if not limit_enabled(complexity_limit):
+        return
+    operation = op if op is not None else compiler.operation
+    complexity = compiler.complexity_of(schema, operation, variables)
+    if complexity > complexity_limit:
+        raise QueryComplexityExceeded(complexity, complexity_limit)
+
+
+def _complexity_envelope(exc: QueryComplexityExceeded) -> dict:
+    return {
+        "data": None,
+        "errors": [
+            {
+                "message": exc.message,
+                "extensions": {"code": exc.code},
+            }
+        ],
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -145,19 +176,30 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        # Read once at startup: an invalid GRAPHQL_QUERY_COMPLEXITY_LIMIT
+        # fails the process with a single diagnostic code before it can
+        # serve any command or open a listening port.
+        complexity_limit = load_complexity_limit()
         if args.command == "query-plan":
             result = _cmd_query_plan(args)
             sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
             return 0
         if args.command == "subscription-push":
-            for row in _cmd_subscription_push(args):
+            for row in _cmd_subscription_push(args, complexity_limit):
                 sys.stdout.write(json.dumps(row, ensure_ascii=False) + "\n")
             return 0
         if args.command == "query-exec":
-            result = _cmd_query_exec(args)
+            result = _cmd_query_exec(args, complexity_limit)
             sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
             return 0
         raise PlanError("InvalidRequest", f"unknown command '{args.command}'")
+    except QueryComplexityExceeded as exc:
+        # A deterministic GraphQL response: no resolvers ran, no entities
+        # were read, no subscription was established.
+        sys.stdout.write(
+            json.dumps(_complexity_envelope(exc), ensure_ascii=False, indent=2) + "\n"
+        )
+        return 0
     except PlanError as exc:
         sys.stderr.write(
             json.dumps({"code": exc.code, "message": exc.message}, ensure_ascii=False)

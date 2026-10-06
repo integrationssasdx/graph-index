@@ -28,6 +28,18 @@ class Planner:
         self.var_map: Dict[str, tuple] = {}
         self.joins: List[dict] = []
 
+    def complexity_of(self, schema: Schema, op, variables: Dict[str, Any]) -> int:
+        """Measure an operation reusing this compiler's fragment/var state.
+
+        Imported lazily so the query-planner path does not depend on the
+        complexity module when the feature is disabled.
+        """
+        from .complexity import measure_complexity
+
+        return measure_complexity(
+            schema, op, self.fragments, variables, self.var_map, self._check_type
+        )
+
     # -- entry point ---------------------------------------------------------
 
     def plan(self, query_text: str, source: str, operation_name: Optional[str]) -> dict:

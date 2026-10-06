@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import PlanError
 from .gql import parse_executable
+from .complexity import BOUND_ARGUMENTS, resolve_bound_argument
 from .planner import Planner
 from .schema import Entity, TypeInfo, named_of
 
@@ -169,6 +170,7 @@ class SubscriptionCompiler(Planner):
             target, entity, node.selection_set, key, entity_keys
         )
         tree = LinkedField(key, key, children=children)
+        self.operation = op
         return SubscriptionPlan(
             op.name, key, entity.table, entity_keys, filter_obj, tree
         )
@@ -209,8 +211,16 @@ class SubscriptionCompiler(Planner):
                     "InvalidQuery",
                     f"missing required argument '{arg_name}' on root field '{node.name}'",
                 )
+        is_list = _is_list_type(field.type_ref)
         filter_obj: Dict[str, Any] = {}
         for arg_name, value in node.args.items():
+            if arg_name in BOUND_ARGUMENTS and is_list:
+                # first/limit on list fields only bound complexity and never
+                # change which entities match the subscription.
+                resolve_bound_argument(
+                    value, self.var_map, self.variables, self._check_type
+                )
+                continue
             if arg_name not in field.args:
                 raise PlanError(
                     "InvalidQuery",
@@ -267,16 +277,23 @@ class SubscriptionCompiler(Planner):
                     seen.add(key)
                     children.append(LinkedField(key, node.name))
                 continue
-            if node.args:
-                raise PlanError(
-                    "InvalidQuery",
-                    f"arguments on field '{node.name}' are not supported",
-                )
             if node.selection_set is None:
                 raise PlanError(
                     "InvalidQuery", f"field '{node.name}' requires a selection set"
                 )
             is_list = _is_list_type(field.type_ref)
+            for arg_name, value in node.args.items():
+                if arg_name in BOUND_ARGUMENTS and is_list:
+                    # first/limit on list fields only bound complexity and
+                    # never change the matched entities.
+                    resolve_bound_argument(
+                        value, self.var_map, self.variables, self._check_type
+                    )
+                    continue
+                raise PlanError(
+                    "InvalidQuery",
+                    f"arguments on field '{node.name}' are not supported",
+                )
             required = field.type_ref[0] == "non_null"
             if field.link is None:
                 raise PlanError(
