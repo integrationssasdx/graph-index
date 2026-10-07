@@ -14,6 +14,7 @@ fields equality-match arbitrary scalar target fields in target insert order.
 
 from __future__ import annotations
 
+import functools
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,7 +106,9 @@ class QueryCompiler(Planner):
 
     def __init__(self, schema: Schema, variables: Dict[str, Any],
                  bound_args_allowed: bool = False):
-        super().__init__(schema, variables, bound_args_allowed)
+        super().__init__(
+            schema, variables, bound_args_allowed, paging_enabled=True
+        )
         self.entity_keys: Dict[str, List[str]] = {}
         self.key_types: Dict[str, List[Any]] = {}
 
@@ -219,6 +222,7 @@ class QueryCompiler(Planner):
                     f"missing required argument '{arg_name}' on root field '{node.name}'",
                 )
         is_list = _is_list_type(field.type_ref)
+        paging = self._compile_paging(node, field, target, is_list)
         filter_obj: Dict[str, Any] = {}
         filter_types: Dict[str, Any] = {}
         for arg_name, value in node.args.items():
@@ -228,6 +232,8 @@ class QueryCompiler(Planner):
                 # are reported by the normal validation phase.
                 if isinstance(value, Var):
                     self._resolve(value)
+                continue
+            if self._is_declared_paging_arg(field, is_list, arg_name):
                 continue
             if arg_name not in field.args:
                 raise PlanError(
@@ -250,6 +256,14 @@ class QueryCompiler(Planner):
         self.key_types[entity.table] = [
             target.fields[name].type_ref for name in entity.key
         ]
+        order_by = paging.get("orderBy")
+        order_type = (
+            named_of(target.fields[order_by].type_ref)
+            if order_by is not None else None
+        )
+        order_type_ref = (
+            target.fields[order_by].type_ref if order_by is not None else None
+        )
         children = self._compile_fields(
             target, entity, node.selection_set, key
         )
@@ -261,6 +275,12 @@ class QueryCompiler(Planner):
             "filter_types": filter_types,
             "is_list": is_list,
             "children": children,
+            "page": paging.get("page", 0),
+            "page_size": paging.get("pageSize"),
+            "order_by": order_by,
+            "order_type": order_type,
+            "order_type_ref": order_type_ref,
+            "sort_desc": paging.get("sortDirection") == "DESC",
         }
 
     # -- selection tree -----------------------------------------------------------
@@ -575,6 +595,11 @@ def _execute_root(root: dict, ctx: ExecContext) -> Any:
                 rows.append(row)
     path = root["response_key"]
     if root["is_list"]:
+        rows = _order_rows(root, rows, ctx, path)
+        page_size = root["page_size"]
+        if page_size is not None:
+            start = root["page"] * page_size
+            rows = rows[start:start + page_size]
         return [_project(root["children"], row, ctx, path) for row in rows]
     if not rows:
         return None
@@ -584,6 +609,97 @@ def _execute_root(root: dict, ctx: ExecContext) -> Any:
             f"single-object root field '{path}' matched {len(rows)} entities",
         )
     return _project(root["children"], rows[0], ctx, path)
+
+
+def _scalar_compare(schema: Schema, type_name: str, a: Any, b: Any) -> int:
+    """Order two non-null scalar/enum values per the orderBy type rules.
+
+    Int/Float compare numerically, String/ID by Unicode code point (an
+    integer ID uses its decimal text), Boolean false-before-true and enums by
+    declaration order (an undeclared enum string sorts after declared ones,
+    then lexicographically).
+    """
+    if type_name in ("Int", "Float"):
+        return (a > b) - (a < b)
+    if type_name == "Boolean":
+        return int(a) - int(b)
+    if type_name in ("String", "ID"):
+        ta = a if isinstance(a, str) else str(a)
+        tb = b if isinstance(b, str) else str(b)
+        return (ta > tb) - (ta < tb)
+    if type_name in schema.enums:
+        order = schema.enum_values[type_name]
+        ia = order.index(a) if a in order else None
+        ib = order.index(b) if b in order else None
+        if ia is not None and ib is not None:
+            return ia - ib
+        if ia is not None:
+            return -1
+        if ib is not None:
+            return 1
+        return (a > b) - (a < b)
+    # Custom scalars are not orderable (rejected at compile time).
+    return 0
+
+
+def _order_rows(
+    root: dict,
+    rows: List[Dict[str, Any]],
+    ctx: ExecContext,
+    path: str,
+) -> List[Dict[str, Any]]:
+    """Stable-sort matching list-root rows, then apply the page window.
+
+    The orderBy value orders non-null rows (ASC small-to-large, DESC
+    large-to-small); nulls -- including snapshots missing the field -- always
+    come last regardless of direction. Equal orderBy values break on the
+    primary key in declared order; still-equal rows keep their stable insert
+    order. The key tie-break and null handling never reverse under DESC.
+    """
+    order_by = root["order_by"]
+    if order_by is None:
+        # No orderBy: the snapshot store already provides stable insert order.
+        return rows
+
+    type_name = root["order_type"]
+    table = root["table"]
+    key_fields = ctx.entity_keys[table]
+    key_types = [named_of(ref) for ref in ctx.key_types[table]]
+    order_ref = root["order_type_ref"]
+
+    # Validate each orderBy value against its schema shape while keeping the
+    # original stable insert position for the final tie-break.
+    indexed: List[Tuple[Any, Dict[str, Any], int]] = []
+    for position, row in enumerate(rows):
+        value = row.get(order_by)
+        if value is not None:
+            _check_value_shape(ctx.schema, order_ref, value, f"{path}({order_by})")
+        indexed.append((value, row, position))
+
+    def compare(left, right) -> int:
+        va, ra, _pa = left
+        vb, rb, _pb = right
+        if va is None or vb is None:
+            # Nulls (including an omitted orderBy field) always sort last;
+            # among themselves they fall through to the key tie-break.
+            if va is None and vb is not None:
+                return 1
+            if vb is None and va is not None:
+                return -1
+        else:
+            result = _scalar_compare(ctx.schema, type_name, va, vb)
+            if result != 0:
+                return -result if root["sort_desc"] else result
+        for key_name, key_type in zip(key_fields, key_types):
+            kc = _scalar_compare(
+                ctx.schema, key_type, ra[key_name], rb[key_name]
+            )
+            if kc != 0:
+                return kc
+        return left[2] - right[2]
+
+    indexed.sort(key=functools.cmp_to_key(compare))
+    return [row for _value, row, _position in indexed]
 
 
 def _matches_filter(root: dict, snapshot: Dict[str, Any], ctx: ExecContext) -> bool:

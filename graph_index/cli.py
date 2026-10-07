@@ -52,7 +52,7 @@ def _cmd_query_plan(args) -> dict:
     schema = load_schema(schema_text, args.schema)
     variables = _load_variables(variables_text, args.variables)
 
-    planner = Planner(schema, variables)
+    planner = Planner(schema, variables, paging_enabled=True)
     return planner.plan(query_text, args.query, args.operation)
 
 
@@ -109,6 +109,7 @@ def _cmd_query_exec(args, complexity_limit) -> dict:
             args.operation,
             QueryCompiler._select_operation,
             complexity_limit,
+            paging_enabled=True,
         )
     ctx = ExecContext(schema, compiler.entity_keys, compiler.key_types)
     # A query that only asks for introspection/meta-fields still requires the

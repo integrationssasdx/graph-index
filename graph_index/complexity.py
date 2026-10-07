@@ -48,7 +48,10 @@ DEFAULT_LIST_BOUND = 1000
 LIMIT_ENV_VAR = "GRAPHQL_QUERY_COMPLEXITY_LIMIT"
 
 # Argument names that may supply a list item upper bound, in priority order.
+# first/limit are the complexity-only bounds; pageSize is the stable-paging
+# argument consulted once neither first nor limit is given.
 BOUND_ARG_NAMES = ("first", "limit")
+PAGING_SIZE_ARG = "pageSize"
 
 
 class QueryComplexityExceeded(PlanError):
@@ -170,8 +173,20 @@ class ComplexityCalculator(Planner):
         return None
 
     def _bound_for(self, node: FieldNode) -> int:
-        """Effective item upper bound for a list field."""
-        for arg_name in BOUND_ARG_NAMES:
+        """Effective item upper bound for a list field.
+
+        Priority is ``first`` then ``limit`` (the complexity-only bounds);
+        for query operations the stable-paging ``pageSize`` argument is also
+        consulted afterwards. The first present candidate decides: its
+        positive-integer value is the bound and any non-positive/non-integer
+        value falls back to DEFAULT_LIST_BOUND, matching the established
+        first/limit rule. Subscription scoring leaves pageSize out, so its
+        list bounds are unchanged.
+        """
+        arg_names = BOUND_ARG_NAMES
+        if self.paging_enabled:
+            arg_names += (PAGING_SIZE_ARG,)
+        for arg_name in arg_names:
             if arg_name in node.args:
                 bound = self._resolve_bound(node.args[arg_name])
                 return bound if bound is not None else DEFAULT_LIST_BOUND
@@ -249,17 +264,22 @@ def enforce_complexity(
     operation_name: Optional[str],
     select_operation: Callable,
     limit: int,
+    paging_enabled: bool = False,
 ) -> int:
     """Re-parse the document, select the operation and enforce the limit.
 
     Invoked only after the command's own compiler has validated the document,
     so any GraphQL/variable/mapping error has already surfaced with its
     existing code. Raises QueryComplexityExceeded when the score is strictly
-    above ``limit``; returns the score otherwise.
+    above ``limit``; returns the score otherwise. ``paging_enabled`` lets
+    query-exec treat the stable-paging ``pageSize`` argument as a list bound;
+    subscription-push leaves it disabled.
     """
     operations, fragments = parse_executable(query_text, source)
     op = select_operation(operations, operation_name)
-    calculator = ComplexityCalculator(schema, variables)
+    calculator = ComplexityCalculator(
+        schema, variables, paging_enabled=paging_enabled
+    )
     complexity = calculator.score_operation(op, fragments)
     if complexity > limit:
         raise QueryComplexityExceeded(complexity, limit)

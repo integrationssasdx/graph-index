@@ -24,6 +24,15 @@ from .schema import Schema, TypeInfo, named_of
 # so baseline argument validation is unchanged when the control is off.
 BOUND_ARG_NAMES = ("first", "limit")
 
+# Stable-paging arguments accepted on a schema list root field once the field
+# declares them (page/pageSize/orderBy/sortDirection). Subscription compilers
+# leave the feature disabled, so the existing unknown-argument rules apply
+# there unchanged.
+PAGING_ARG_NAMES = ("page", "pageSize", "orderBy", "sortDirection")
+SORT_DIRECTIONS = ("ASC", "DESC")
+# Named types an orderBy target field may use (single-valued, non-list).
+ORDERABLE_TYPE_NAMES = ("Int", "Float", "String", "ID", "Boolean")
+
 
 def _is_list_type(type_ref) -> bool:
     """Whether a (possibly non-null wrapped) field type is a list."""
@@ -34,12 +43,17 @@ def _is_list_type(type_ref) -> bool:
 
 class Planner:
     def __init__(self, schema: Schema, variables: Dict[str, Any],
-                 bound_args_allowed: bool = False):
+                 bound_args_allowed: bool = False,
+                 paging_enabled: bool = False):
         self.schema = schema
         self.variables = variables
         # When a complexity limit is configured, list fields accept first/limit
         # bounds (literal or variable); otherwise arguments stay unsupported.
         self.bound_args_allowed = bound_args_allowed
+        # query-plan/query-exec recognize the page/pageSize/orderBy/
+        # sortDirection arguments on list root fields that declare them;
+        # subscription-push keeps its existing argument rules.
+        self.paging_enabled = paging_enabled
         self.fragments: Dict[str, Any] = {}
         self.var_map: Dict[str, tuple] = {}
         self.joins: List[dict] = []
@@ -59,6 +73,102 @@ class Planner:
             and is_list_field
             and arg_name in BOUND_ARG_NAMES
         )
+
+    # -- stable paging arguments ----------------------------------------------
+
+    def _is_declared_paging_arg(
+        self, field, is_list_field: bool, arg_name: str
+    ) -> bool:
+        """Whether a page/pageSize/orderBy/sortDirection arg is accepted here.
+
+        Only list root fields opt in, and only for the arguments the schema
+        actually declares on the field; an undeclared argument keeps falling
+        through to the ordinary unknown-argument rejection.
+        """
+        return (
+            self.paging_enabled
+            and is_list_field
+            and arg_name in PAGING_ARG_NAMES
+            and arg_name in field.args
+        )
+
+    def _compile_paging(self, node: FieldNode, field, target: TypeInfo,
+                        is_list_field: bool) -> Dict[str, Any]:
+        """Resolve and validate the stable-paging arguments of a list root.
+
+        Returns a dict that may carry ``page``/``pageSize`` (int),
+        ``orderBy`` (str) and ``sortDirection`` (``"ASC"``/``"DESC"``); absent
+        arguments simply omit their key. A statically invalid literal ends
+        with InvalidQuery; an invalid variable value or type ends with
+        VariablesError (undeclared/missing/wrong-typed variables are reported
+        by the shared variable resolver first).
+        """
+        raw_args = node.args
+        resolved: Dict[str, tuple] = {}
+        for arg_name in PAGING_ARG_NAMES:
+            if arg_name in raw_args and self._is_declared_paging_arg(
+                field, is_list_field, arg_name
+            ):
+                raw = raw_args[arg_name]
+                resolved[arg_name] = (raw, self._resolve(raw))
+
+        def fail(arg_name: str, message: str) -> None:
+            from_var = isinstance(resolved[arg_name][0], Var)
+            raise PlanError(
+                "VariablesError" if from_var else "InvalidQuery", message
+            )
+
+        if "page" in resolved:
+            value = resolved["page"][1]
+            if isinstance(value, bool) or not isinstance(value, int):
+                fail("page", f"paging argument 'page' on root field "
+                             f"'{node.name}' must be an integer")
+            if value < 0:
+                fail("page", f"paging argument 'page' on root field "
+                             f"'{node.name}' must not be negative")
+        if "pageSize" in resolved:
+            value = resolved["pageSize"][1]
+            if isinstance(value, bool) or not isinstance(value, int):
+                fail("pageSize", f"paging argument 'pageSize' on root field "
+                                 f"'{node.name}' must be a positive integer")
+            if value < 1:
+                fail("pageSize", f"paging argument 'pageSize' on root field "
+                                 f"'{node.name}' must be at least 1")
+        if "page" in resolved and "pageSize" not in resolved:
+            fail("page", f"paging argument 'page' on root field '{node.name}' "
+                         f"requires 'pageSize'")
+        if "orderBy" in resolved:
+            value = resolved["orderBy"][1]
+            if not isinstance(value, str):
+                fail("orderBy", f"paging argument 'orderBy' on root field "
+                                f"'{node.name}' must be a field name string")
+            order_field = target.fields.get(value)
+            if order_field is None:
+                fail("orderBy", f"orderBy field '{value}' is not a field of "
+                                f"entity type '{target.name}'")
+            type_ref = order_field.type_ref
+            type_name = named_of(type_ref)
+            if _is_list_type(type_ref):
+                fail("orderBy", f"orderBy field '{value}' of entity type "
+                                f"'{target.name}' must not be a list")
+            if type_ref[0] != "non_null":
+                fail("orderBy", f"orderBy field '{value}' of entity type "
+                                f"'{target.name}' must be non-null")
+            if type_name not in ORDERABLE_TYPE_NAMES and type_name not in self.schema.enums:
+                fail("orderBy", f"orderBy field '{value}' of entity type "
+                                f"'{target.name}' must be a scalar Int, Float, "
+                                f"String, ID, Boolean or enum field")
+        if "sortDirection" in resolved:
+            value = resolved["sortDirection"][1]
+            if not isinstance(value, str) or value not in SORT_DIRECTIONS:
+                fail("sortDirection",
+                     f"paging argument 'sortDirection' on root field "
+                     f"'{node.name}' must be ASC or DESC")
+            if "orderBy" not in resolved:
+                fail("sortDirection",
+                     f"paging argument 'sortDirection' on root field "
+                     f"'{node.name}' requires 'orderBy'")
+        return {name: resolved[name][1] for name in resolved}
 
     # -- entry point ---------------------------------------------------------
 
@@ -284,8 +394,12 @@ class Planner:
                     "UnknownField",
                     f"missing required argument '{arg_name}' on root field '{node.name}'",
                 )
+        is_list = _is_list_type(field.type_ref)
+        paging = self._compile_paging(node, field, target, is_list)
         filter_obj: Dict[str, Any] = {}
         for arg_name, value in node.args.items():
+            if self._is_declared_paging_arg(field, is_list, arg_name):
+                continue
             if arg_name not in field.args:
                 raise PlanError(
                     "UnknownField",
@@ -300,7 +414,16 @@ class Planner:
                     f"argument '{arg_name}' does not match a filterable field of entity '{entity.table}'",
                 )
             filter_obj[arg_name] = self._resolve(value)
-        entry = {"path": key, "entity": entity.table, "filter": filter_obj, "fields": []}
+        entry = {
+            "path": key,
+            "entity": entity.table,
+            "filter": filter_obj,
+            "fields": [],
+            "page": paging.get("page", 0),
+            "pageSize": paging.get("pageSize"),
+            "orderBy": paging.get("orderBy"),
+            "sortDirection": paging.get("sortDirection", "ASC"),
+        }
         self._walk(target, entity, node.selection_set, key, entry)
         return entry
 
