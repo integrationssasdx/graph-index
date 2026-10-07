@@ -11,6 +11,17 @@ List fields match every current target snapshot whose @link target field
 values equal the source's local field values; the matched targets are
 recursively projected in target insert order. The @link target of a list
 relationship need not be (part of) the target entity's primary key.
+
+A root entity's own INSERT/UPDATE/DELETE keeps the original behaviour: the
+event snapshot must match the filter and the record carries the operation
+name. In addition, an event on any entity reachable through the selected
+@link tree is treated as a possible dependency change. After applying it,
+every root snapshot that currently matches the filter is re-projected and
+compared with its projection just before the event; each root whose selected
+projection actually changed gets one synthetic record appended right after
+the triggering event, with ``event`` fixed to UPDATE, the root entity table
+as ``entity``, the subscription's own path and the full changed projection.
+Changed roots are emitted in the root store's stable insert order.
 """
 
 from __future__ import annotations
@@ -38,6 +49,7 @@ class SubscriptionPlan:
         "entity_keys",
         "filter",
         "tree",
+        "reachable_tables",
     )
 
     def __init__(
@@ -48,6 +60,7 @@ class SubscriptionPlan:
         entity_keys: Dict[str, List[str]],
         filter_obj: Dict[str, Any],
         tree: "LinkedField",
+        reachable_tables: Optional[set] = None,
     ):
         self.operation_name = operation_name
         self.path = path
@@ -57,6 +70,11 @@ class SubscriptionPlan:
         self.entity_keys = entity_keys
         self.filter = filter_obj  # entity field name -> expected value
         self.tree = tree  # compiled selection tree rooted at the root field
+        # the root table plus every target table of a selected @link; an event
+        # on one of these may change a matching root's selected projection
+        self.reachable_tables = (
+            {entity_table} if reachable_tables is None else reachable_tables
+        )
 
     def matches(self, snapshot: Dict[str, Any]) -> bool:
         for name, expected in self.filter.items():
@@ -172,8 +190,11 @@ class SubscriptionCompiler(Planner):
             target, entity, node.selection_set, key, entity_keys
         )
         tree = LinkedField(key, key, children=children)
+        reachable_tables = {entity.table}
+        _collect_target_tables(children, reachable_tables)
         return SubscriptionPlan(
-            op.name, key, entity.table, entity_keys, filter_obj, tree
+            op.name, key, entity.table, entity_keys, filter_obj, tree,
+            reachable_tables,
         )
 
     # -- operation selection ---------------------------------------------------
@@ -378,6 +399,15 @@ def _is_scalar_value_field(schema, field) -> bool:
     )
 
 
+def _collect_target_tables(nodes: List["LinkedField"], tables: set) -> None:
+    """Gather the target table of every @link in a compiled selection tree."""
+    for node in nodes:
+        if node.children is not None:
+            if node.target_table is not None:
+                tables.add(node.target_table)
+            _collect_target_tables(node.children, tables)
+
+
 # ---------------------------------------------------------------------------
 # Event processing
 # ---------------------------------------------------------------------------
@@ -426,6 +456,14 @@ def push_events(
     Every line is parsed and validated first; the latest snapshot of each
     entity is then maintained by primary key, and matching root events are
     projected against the snapshots known up to and including that line.
+
+    Beyond a root entity's own INSERT/UPDATE/DELETE, an event on any entity
+    reachable through the selected @link tree is treated as a possible
+    dependency change: the projections of every currently matching root are
+    compared before and after the event, and each root whose projection
+    actually changed gets one synthetic UPDATE record appended right after the
+    triggering event. Root events never get such a record, since the root's
+    own record already carries its post-event projection.
     """
     events: List[Tuple[int, Dict[str, Any]]] = []
     for lineno, raw in enumerate(events_text.splitlines(), 1):
@@ -436,19 +474,104 @@ def push_events(
 
     snapshots: Dict[str, _OrderedStore] = {}
     outputs: List[Dict[str, Any]] = []
+    root_keys = plan.entity_keys[plan.entity_table]
     for lineno, event in events:
+        is_root_event = event["entity"] == plan.entity_table
+        # Dependency records are only appended for events on non-root tables
+        # reachable through the selection tree. Root events keep their original
+        # behaviour exactly, including which snapshots get projected, so the
+        # before/after sweep must not run for them.
+        track_dependencies = (
+            not is_root_event and event["entity"] in plan.reachable_tables
+        )
+        before_projections: Dict[Tuple[Any, ...], Any] = (
+            _project_matching_roots(plan, snapshots, source, lineno, root_keys)
+            if track_dependencies
+            else {}
+        )
+
         _apply_event(plan.entity_keys, snapshots, event)
-        if event["entity"] != plan.entity_table:
-            continue
-        op = event["op"]
-        snapshot = event["after"] if op in ("INSERT", "UPDATE") else event["before"]
-        if snapshot is None:
-            raise PlanError(
-                "EventError", f"{source}:{lineno}: {op} event has no snapshot"
+
+        if is_root_event:
+            op = event["op"]
+            snapshot = (
+                event["after"] if op in ("INSERT", "UPDATE") else event["before"]
             )
+            if snapshot is None:
+                raise PlanError(
+                    "EventError", f"{source}:{lineno}: {op} event has no snapshot"
+                )
+            if not plan.matches(snapshot):
+                continue
+            data = _project(
+                plan.tree.children,
+                snapshot,
+                snapshots,
+                plan.entity_keys,
+                source,
+                lineno,
+                plan.path,
+            )
+            outputs.append(
+                {
+                    "subscription": plan.operation_name,
+                    "path": plan.path,
+                    "event": op,
+                    "entity": event["entity"],
+                    "data": data,
+                }
+            )
+            continue
+
+        if not track_dependencies:
+            continue
+
+        after_projections = _project_matching_roots(
+            plan, snapshots, source, lineno, root_keys
+        )
+        # Root snapshots are untouched by a non-root event, so every key in the
+        # after-map was already present before it; only changed projections are
+        # reported, in root insert order (the store's stable ordering).
+        for key, after_data in after_projections.items():
+            before_data = before_projections.get(key)
+            if before_data is None or before_data == after_data:
+                continue
+            outputs.append(
+                {
+                    "subscription": plan.operation_name,
+                    "path": plan.path,
+                    "event": "UPDATE",
+                    "entity": plan.entity_table,
+                    "data": after_data,
+                }
+            )
+    return outputs
+
+
+def _project_matching_roots(
+    plan: SubscriptionPlan,
+    snapshots: Dict[str, _OrderedStore],
+    source: str,
+    lineno: int,
+    root_keys: List[str],
+) -> Dict[Tuple[Any, ...], Any]:
+    """Project every current matching root snapshot, keyed by primary key.
+
+    Rows without a usable primary key cannot be tracked across an event and
+    are skipped here; they still surface through their own root event when it
+    projects them. Iteration follows the root store's stable insert order.
+    """
+    store = snapshots.get(plan.entity_table)
+    if store is None:
+        return {}
+    projections: Dict[Tuple[Any, ...], Any] = {}
+    for snapshot in store.values():
+        key = _key_tuple(root_keys, snapshot)
+        if key is None:
+            continue
         if not plan.matches(snapshot):
             continue
-        data = _project(
+        projections[key] = _project(
             plan.tree.children,
             snapshot,
             snapshots,
@@ -457,16 +580,7 @@ def push_events(
             lineno,
             plan.path,
         )
-        outputs.append(
-            {
-                "subscription": plan.operation_name,
-                "path": plan.path,
-                "event": op,
-                "entity": event["entity"],
-                "data": data,
-            }
-        )
-    return outputs
+    return projections
 
 
 def _apply_event(

@@ -888,14 +888,28 @@ class CliCase(unittest.TestCase):
                 schema=LIST_SCHEMA, events=events,
             )
         )
+        # The root INSERT and the two root UPDATEs frame synthetic dependency
+        # UPDATEs emitted right after the review DELETE and re-INSERT.
+        self.assertEqual([r["event"] for r in rows],
+                         ["INSERT", "UPDATE", "UPDATE", "UPDATE", "UPDATE"])
+        self.assertTrue(all(r["entity"] == "users" for r in rows))
+        self.assertEqual([r["path"] for r in rows], ["users"] * 5)
         self.assertEqual(rows[0]["data"]["reviews"], [
             {"id": "r1", "score": 1}, {"id": "r2", "score": 2},
         ])
+        # dependency record after the DELETE
         self.assertEqual(rows[1]["data"]["reviews"], [
             {"id": "r2", "score": 2},
         ])
-        # re-INSERTed r1 sorts after r2 even though it first appeared earlier
         self.assertEqual(rows[2]["data"]["reviews"], [
+            {"id": "r2", "score": 2},
+        ])
+        # re-INSERTed r1 sorts after r2 even though it first appeared earlier;
+        # the dependency record after that INSERT already shows the final order
+        self.assertEqual(rows[3]["data"]["reviews"], [
+            {"id": "r2", "score": 2}, {"id": "r1", "score": 11},
+        ])
+        self.assertEqual(rows[4]["data"]["reviews"], [
             {"id": "r2", "score": 2}, {"id": "r1", "score": 11},
         ])
 
@@ -1122,6 +1136,303 @@ class CliCase(unittest.TestCase):
             ),
             "UnknownEntity",
         )
+
+    # -- dependency change push --------------------------------------------------
+
+    def test_dependency_object_target_update_appends_root_update(self):
+        events = "\n".join([
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "status": "active", "team_id": 9}),
+            _event("UPDATE", "teams",
+                   {"id": 9, "name": "core"}, {"id": 9, "name": "platform"}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id team { name } } }",
+                schema=NESTED_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows], ["INSERT", "UPDATE"])
+        self.assertEqual([r["entity"] for r in rows], ["users", "users"])
+        self.assertEqual([r["path"] for r in rows], ["users", "users"])
+        self.assertEqual(rows[0]["data"], {"id": 1, "team": {"name": "core"}})
+        self.assertEqual(rows[1]["data"],
+                         {"id": 1, "team": {"name": "platform"}})
+
+    def test_dependency_record_uses_subscription_name_and_path(self):
+        events = "\n".join([
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "team_id": 9}),
+            _event("UPDATE", "teams",
+                   {"id": 9, "name": "core"}, {"id": 9, "name": "platform"}),
+        ]) + "\n"
+        subscription = """
+        subscription WatchTeam {
+          watched: users { myTeam: team { name } }
+        }
+        """
+        rows = self.assert_rows(
+            *self.run_cli(subscription, schema=NESTED_SCHEMA, events=events)
+        )
+        self.assertEqual(len(rows), 2)
+        record = rows[1]
+        self.assertEqual(record["subscription"], "WatchTeam")
+        self.assertEqual(record["path"], "watched")
+        self.assertEqual(record["event"], "UPDATE")
+        self.assertEqual(record["entity"], "users")
+        self.assertEqual(record["data"],
+                         {"myTeam": {"name": "platform"}})
+
+    def test_dependency_change_to_unselected_field_makes_no_noise(self):
+        events = "\n".join([
+            _event("INSERT", "teams", None,
+                   {"id": 9, "name": "core", "league_id": 5}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "team_id": 9}),
+            # league_id is not projected through team, so changing it does not
+            # alter the selected projection
+            _event("UPDATE", "teams",
+                   {"id": 9, "name": "core", "league_id": 5},
+                   {"id": 9, "name": "core", "league_id": 6}),
+            # an in-place UPDATE with identical content also makes no noise
+            _event("UPDATE", "teams",
+                   {"id": 9, "name": "core", "league_id": 6},
+                   {"id": 9, "name": "core", "league_id": 6}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id team { name } } }",
+                schema=NESTED_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows], ["INSERT"])
+
+    def test_dependency_deep_link_change_propagates(self):
+        events = "\n".join([
+            _event("INSERT", "leagues", None, {"id": 5, "title": "L1"}),
+            _event("INSERT", "teams", None,
+                   {"id": 9, "name": "core", "league_id": 5}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "team_id": 9}),
+            _event("UPDATE", "leagues",
+                   {"id": 5, "title": "L1"}, {"id": 5, "title": "L2"}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id team { name league { title } } } }",
+                schema=NESTED_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows], ["INSERT", "UPDATE"])
+        self.assertEqual(rows[1]["data"],
+                         {"id": 1, "team": {
+                             "name": "core", "league": {"title": "L2"}}})
+
+    def test_dependency_null_object_relationship_stays_null(self):
+        events = "\n".join([
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "team_id": None}),
+            # inserting a target cannot resolve a relationship whose local key
+            # is null: no projection change, no record
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+            _event("UPDATE", "teams",
+                   {"id": 9, "name": "core"}, {"id": 9, "name": "x"}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id team { name } } }",
+                schema=NESTED_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows], ["INSERT"])
+        self.assertEqual(rows[0]["data"], {"id": 1, "team": None})
+
+    def test_dependency_event_on_unreachable_entity_ignored(self):
+        events = "\n".join([
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 1, "score": 5}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 9}),
+            # orgs is reachable in the schema but not from this selection tree
+            _event("INSERT", "orgs", None, {"id": 9, "name": "core"}),
+            _event("UPDATE", "orgs",
+                   {"id": 9, "name": "core"}, {"id": 9, "name": "other"}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id reviews { score } } }",
+                schema=LIST_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows], ["INSERT"])
+
+    def test_dependency_only_pushed_for_roots_still_matching_filter(self):
+        events = "\n".join([
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "status": "banned", "team_id": 9}),
+            # banned root is not currently matching: the target change is silent
+            _event("UPDATE", "teams",
+                   {"id": 9, "name": "core"}, {"id": 9, "name": "platform"}),
+            # the root's own UPDATE brings it into the filter
+            _event("UPDATE", "users",
+                   {"id": 1, "name": "ada", "status": "banned", "team_id": 9},
+                   {"id": 1, "name": "ada", "status": "active", "team_id": 9}),
+            # now a target change reaches it
+            _event("UPDATE", "teams",
+                   {"id": 9, "name": "platform"}, {"id": 9, "name": "core"}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                'subscription { users(status: "active") { id team { name } } }',
+                schema=NESTED_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows], ["UPDATE", "UPDATE"])
+        self.assertEqual(rows[0]["data"],
+                         {"id": 1, "team": {"name": "platform"}})
+        self.assertEqual(rows[1]["data"],
+                         {"id": 1, "team": {"name": "core"}})
+
+    def test_dependency_list_target_insert_update_delete(self):
+        events = "\n".join([
+            _event("INSERT", "users", None,
+                   {"id": 7, "name": "grace", "org_id": 1}),
+            _event("INSERT", "reviews", None,
+                   {"id": "r1", "user_id": 7, "score": 1}),
+            _event("UPDATE", "reviews",
+                   {"id": "r1", "user_id": 7, "score": 1},
+                   {"id": "r1", "user_id": 7, "score": 10}),
+            _event("UPDATE", "reviews",
+                   {"id": "r1", "user_id": 7, "score": 10},
+                   {"id": "r1", "user_id": 8, "score": 10}),
+            # the review already left the group, so its DELETE changes nothing
+            _event("DELETE", "reviews",
+                   {"id": "r1", "user_id": 8, "score": 10}, None),
+            # a review for another user never affects the root projection
+            _event("INSERT", "reviews", None,
+                   {"id": "r2", "user_id": 99, "score": 4}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id reviews { id score } } }",
+                schema=LIST_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows],
+                         ["INSERT", "UPDATE", "UPDATE", "UPDATE"])
+        self.assertTrue(all(r["entity"] == "users" for r in rows))
+        self.assertEqual(rows[0]["data"]["reviews"], [])
+        self.assertEqual(rows[1]["data"]["reviews"],
+                         [{"id": "r1", "score": 1}])
+        self.assertEqual(rows[2]["data"]["reviews"],
+                         [{"id": "r1", "score": 10}])
+        self.assertEqual(rows[3]["data"]["reviews"], [])
+
+    def test_dependency_multiple_roots_follow_stable_insert_order(self):
+        events = "\n".join([
+            _event("INSERT", "orders", None,
+                   {"id": "o1", "chain": 1, "ref": "R"}),
+            _event("INSERT", "orders", None,
+                   {"id": "o2", "chain": 1, "ref": "R"}),
+            _event("INSERT", "orders", None,
+                   {"id": "o3", "chain": 2, "ref": "R"}),
+            _event("INSERT", "lines", None,
+                   {"id": "a", "chain": 1, "ref": "R", "qty": 2}),
+        ]) + "\n"
+        subscription = (
+            "subscription { orders(chain: 1) { id lines { id qty } } }"
+        )
+        rows = self.assert_rows(
+            *self.run_cli(
+                subscription, schema=COMPOSITE_LIST_SCHEMA, events=events
+            )
+        )
+        self.assertEqual([r["event"] for r in rows],
+                         ["INSERT", "INSERT", "UPDATE", "UPDATE"])
+        # the chain-2 order is filtered out and never appears
+        self.assertEqual([r["data"]["id"] for r in rows[:2]], ["o1", "o2"])
+        self.assertEqual(rows[2]["data"]["id"], "o1")
+        self.assertEqual(rows[3]["data"]["id"], "o2")
+        self.assertEqual(rows[2]["data"]["lines"], [{"id": "a", "qty": 2}])
+        self.assertEqual(rows[3]["data"]["lines"], [{"id": "a", "qty": 2}])
+
+    def test_dependency_order_reattaches_after_root_reinsert(self):
+        events = "\n".join([
+            _event("INSERT", "orders", None,
+                   {"id": "o1", "chain": 1, "ref": "R"}),
+            _event("INSERT", "orders", None,
+                   {"id": "o2", "chain": 1, "ref": "R"}),
+            _event("DELETE", "orders",
+                   {"id": "o1", "chain": 1, "ref": "R"}, None),
+            _event("INSERT", "orders", None,
+                   {"id": "o1", "chain": 1, "ref": "R"}),
+            _event("INSERT", "lines", None,
+                   {"id": "a", "chain": 1, "ref": "R", "qty": 2}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { orders(chain: 1) { id lines { id } } }",
+                schema=COMPOSITE_LIST_SCHEMA, events=events,
+            )
+        )
+        # the re-INSERTed root sorts last, so its dependency record does too
+        self.assertEqual([r["event"] for r in rows],
+                         ["INSERT", "INSERT", "DELETE", "INSERT",
+                          "UPDATE", "UPDATE"])
+        self.assertEqual([r["data"]["id"] for r in rows[-2:]], ["o2", "o1"])
+
+    def test_dependency_target_delete_missing_object_is_event_error(self):
+        events = "\n".join([
+            _event("INSERT", "teams", None, {"id": 9, "name": "core"}),
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "team_id": 9}),
+            _event("DELETE", "teams", {"id": 9, "name": "core"}, None),
+        ]) + "\n"
+        code, stdout, stderr = self.run_cli(
+            "subscription { users { id team { name } } }",
+            schema=NESTED_SCHEMA, events=events,
+        )
+        self.assert_error(code, stdout, stderr, "EventError")
+
+    def test_dependency_malformed_target_snapshot_is_event_error(self):
+        events = "\n".join([
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 1}),
+            # the new review lacks the list @link match field user_id; the
+            # dependency sweep must reject it instead of emitting partial rows
+            _event("INSERT", "reviews", None, {"id": "r9", "score": 5}),
+        ]) + "\n"
+        code, stdout, stderr = self.run_cli(
+            "subscription { users { id reviews { score } } }",
+            schema=LIST_SCHEMA, events=events,
+        )
+        self.assert_error(code, stdout, stderr, "EventError")
+
+    def test_root_table_events_never_get_synthetic_dependency_records(self):
+        # mates is a list @link from users back into users: even though a users
+        # event changes another root's selected projection, the changing entity
+        # is the root table itself and only the event's own records are emitted
+        events = "\n".join([
+            _event("INSERT", "users", None,
+                   {"id": 1, "name": "ada", "org_id": 9}),
+            _event("INSERT", "users", None,
+                   {"id": 2, "name": "bob", "org_id": 9}),
+            _event("UPDATE", "users",
+                   {"id": 1, "name": "ada", "org_id": 9},
+                   {"id": 1, "name": "ada", "org_id": 9}),
+        ]) + "\n"
+        rows = self.assert_rows(
+            *self.run_cli(
+                "subscription { users { id mates { id } } }",
+                schema=LIST_SCHEMA, events=events,
+            )
+        )
+        self.assertEqual([r["event"] for r in rows],
+                         ["INSERT", "INSERT", "UPDATE"])
+        self.assertEqual([r["data"]["id"] for r in rows], [1, 2, 1])
 
     # -- nested selection compile errors -------------------------------------------
 
