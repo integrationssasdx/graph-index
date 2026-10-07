@@ -15,6 +15,7 @@ fields equality-match arbitrary scalar target fields in target insert order.
 from __future__ import annotations
 
 import json
+from functools import cmp_to_key
 from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import PlanError
@@ -24,7 +25,7 @@ from .introspection import (
     render_schema_root,
     render_type_root,
 )
-from .planner import Planner
+from .planner import PAGING_ARG_NAMES, Planner
 from .schema import Entity, Schema, TypeInfo, named_of
 from .subscription import EVENT_OPS, _OrderedStore, _is_list_type
 
@@ -219,9 +220,18 @@ class QueryCompiler(Planner):
                     f"missing required argument '{arg_name}' on root field '{node.name}'",
                 )
         is_list = _is_list_type(field.type_ref)
+        paging = self._compile_paging(node, field, target) if is_list else None
         filter_obj: Dict[str, Any] = {}
         filter_types: Dict[str, Any] = {}
         for arg_name, value in node.args.items():
+            if paging is not None and arg_name in PAGING_ARG_NAMES:
+                if arg_name not in field.args:
+                    raise PlanError(
+                        "UnknownField",
+                        f"unknown argument '{arg_name}' on root field "
+                        f"'{node.name}'",
+                    )
+                continue
             if self._accepts_bound_arg(is_list, arg_name):
                 # A list-size bound used for complexity; never a filter. If it
                 # is a variable, resolve it so type/required-variable errors
@@ -253,7 +263,7 @@ class QueryCompiler(Planner):
         children = self._compile_fields(
             target, entity, node.selection_set, key
         )
-        return {
+        compiled = {
             "response_key": key,
             "field_name": node.name,
             "table": entity.table,
@@ -262,6 +272,20 @@ class QueryCompiler(Planner):
             "is_list": is_list,
             "children": children,
         }
+        if paging is not None:
+            order_type = None
+            if paging["orderBy"] is not None:
+                order_type = target.fields[paging["orderBy"]].type_ref
+            compiled["paging"] = {
+                "page": paging["page"],
+                "page_size": paging["pageSize"],
+                "order_by": paging["orderBy"],
+                "order_type": order_type,
+                "sort_direction": paging["sortDirection"],
+                "key_fields": list(entity.key),
+                "key_types": [target.fields[n].type_ref for n in entity.key],
+            }
+        return compiled
 
     # -- selection tree -----------------------------------------------------------
 
@@ -575,6 +599,7 @@ def _execute_root(root: dict, ctx: ExecContext) -> Any:
                 rows.append(row)
     path = root["response_key"]
     if root["is_list"]:
+        rows = _sort_and_paginate(root, rows, ctx, path)
         return [_project(root["children"], row, ctx, path) for row in rows]
     if not rows:
         return None
@@ -584,6 +609,125 @@ def _execute_root(root: dict, ctx: ExecContext) -> Any:
             f"single-object root field '{path}' matched {len(rows)} entities",
         )
     return _project(root["children"], rows[0], ctx, path)
+
+
+def _sort_and_paginate(
+    root: dict,
+    rows: List[Dict[str, Any]],
+    ctx: ExecContext,
+    path: str,
+) -> List[Dict[str, Any]]:
+    """Apply stable ordering then zero-based paging for one list root.
+
+    Rows arrive in stable insert order (UPDATE replaces in place, a DELETE
+    followed by re-INSERT lands at the end); without orderBy that order is
+    kept. With orderBy the sort value comes first (nulls always last, in both
+    directions), then the primary key in declared order, then the original
+    insert position as the final tie-break.
+    """
+    paging = root.get("paging")
+    if paging is not None and paging["order_by"] is not None:
+        order_name = paging["order_by"]
+        order_type = paging["order_type"]
+        direction = paging["sort_direction"]
+        key_fields = paging["key_fields"]
+        key_types = paging["key_types"]
+
+        def sort_value(row):
+            if order_name not in row:
+                raise PlanError(
+                    "EventError",
+                    f"snapshot of entity '{root['table']}' is missing orderBy "
+                    f"field '{order_name}'",
+                )
+            value = row[order_name]
+            # A present-but-null sort value sorts last; any other shape that
+            # contradicts the declared type remains an EventError.
+            if value is not None:
+                _check_value_shape(ctx.schema, order_type, value, path)
+            return value
+
+        def key_values(row):
+            values = []
+            for name, type_ref in zip(key_fields, key_types):
+                if name not in row:
+                    raise PlanError(
+                        "EventError",
+                        f"snapshot of entity '{root['table']}' is missing "
+                        f"primary key field '{name}'",
+                    )
+                values.append(row[name])
+            return values
+
+        decorated = [
+            (index, row, sort_value(row), key_values(row))
+            for index, row in enumerate(rows)
+        ]
+
+        def compare(left, right):
+            a, b = left[2], right[2]
+            if a is None or b is None:
+                # Nulls always sort last, in both directions; the null group
+                # itself keeps the stable primary-key/insert tie order.
+                if a is None and b is None:
+                    result = 0
+                else:
+                    return 1 if a is None else -1
+            else:
+                result = _compare_sort_values(a, b, order_type, ctx)
+                if direction == "DESC":
+                    result = -result
+            if result == 0:
+                for ka, kb in zip(left[3], right[3]):
+                    result = _compare_scalar(ka, kb)
+                    if result != 0:
+                        break
+            if result == 0:
+                result = (left[0] > right[0]) - (left[0] < right[0])
+            return result
+
+        decorated.sort(key=cmp_to_key(compare))
+        rows = [row for _index, row, _value, _keys in decorated]
+
+    if paging is not None and paging["page_size"] is not None:
+        size = paging["page_size"]
+        start = paging["page"] * size
+        rows = rows[start : start + size]
+    return rows
+
+
+def _compare_sort_values(a, b, type_ref, ctx: ExecContext) -> int:
+    """Compare two non-null orderBy values per the declared field type."""
+    name = named_of(type_ref)
+    if name == "Boolean":
+        # false before true
+        return (1 if a else 0) - (1 if b else 0)
+    if name in ctx.schema.enums:
+        # Declared enum order; a snapshot string outside the declaration is
+        # ordered after the known values and compared lexicographically.
+        order = ctx.schema.enum_values[name]
+        rank_a = order.index(a) if a in order else len(order)
+        rank_b = order.index(b) if b in order else len(order)
+        if rank_a != rank_b:
+            return rank_a - rank_b
+        if rank_a == len(order):
+            return _compare_scalar(a, b)
+        return 0
+    # Int/Float numerically; String/ID by Unicode code point.
+    return _compare_scalar(a, b)
+
+
+def _compare_scalar(a, b) -> int:
+    """Order numeric values together and strings after, without type errors."""
+    rank_a = 1 if isinstance(a, (int, float)) and not isinstance(a, bool) else 2
+    rank_b = 1 if isinstance(b, (int, float)) and not isinstance(b, bool) else 2
+    if rank_a != rank_b:
+        return rank_a - rank_b
+    if a < b:
+        return -1
+    if a > b:
+        return 1
+    return 0
 
 
 def _matches_filter(root: dict, snapshot: Dict[str, Any], ctx: ExecContext) -> bool:

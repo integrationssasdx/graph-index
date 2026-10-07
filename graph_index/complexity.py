@@ -48,7 +48,8 @@ DEFAULT_LIST_BOUND = 1000
 LIMIT_ENV_VAR = "GRAPHQL_QUERY_COMPLEXITY_LIMIT"
 
 # Argument names that may supply a list item upper bound, in priority order.
-BOUND_ARG_NAMES = ("first", "limit")
+# pageSize (stable pagination) is the final fallback before DEFAULT_LIST_BOUND.
+BOUND_ARG_NAMES = ("first", "limit", "pageSize")
 
 
 class QueryComplexityExceeded(PlanError):

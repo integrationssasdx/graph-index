@@ -24,6 +24,11 @@ from .schema import Schema, TypeInfo, named_of
 # so baseline argument validation is unchanged when the control is off.
 BOUND_ARG_NAMES = ("first", "limit")
 
+# Stable pagination/sorting arguments accepted on a schema list root field
+# that explicitly declares them.
+PAGING_ARG_NAMES = ("page", "pageSize", "orderBy", "sortDirection")
+SORT_DIRECTIONS = ("ASC", "DESC")
+
 
 def _is_list_type(type_ref) -> bool:
     """Whether a (possibly non-null wrapped) field type is a list."""
@@ -59,6 +64,151 @@ class Planner:
             and is_list_field
             and arg_name in BOUND_ARG_NAMES
         )
+
+    # -- stable pagination / sorting -----------------------------------------
+
+    def _compile_paging(
+        self, node: FieldNode, field, target: TypeInfo
+    ) -> Dict[str, Any]:
+        """Validate and resolve the four paging arguments of a list root.
+
+        The arguments are only recognized when the schema field itself
+        declares them; otherwise they keep failing as unknown arguments in the
+        caller. Static literals that violate the contract fail with
+        InvalidQuery; variable-provided failures surface as VariablesError.
+        """
+        def declared(arg_name: str) -> bool:
+            return arg_name in field.args
+
+        page_present = declared("page") and "page" in node.args
+        size_present = declared("pageSize") and "pageSize" in node.args
+        # An explicit null counts as "not supplied" for orderBy/sortDirection:
+        # both arguments are nullable strings, and null leaves insertion order.
+        order_present = (
+            declared("orderBy")
+            and node.args.get("orderBy") is not None
+        )
+        direction_present = (
+            declared("sortDirection")
+            and node.args.get("sortDirection") is not None
+        )
+
+        page = 0
+        if page_present:
+            page = self._resolve_paging_int("page", node.args["page"], True)
+        page_size = None
+        if size_present:
+            page_size = self._resolve_paging_int(
+                "pageSize", node.args["pageSize"], False
+            )
+        order_by = None
+        if order_present:
+            order_by = self._resolve_order_by(node.args["orderBy"], target)
+        sort_direction = "ASC"
+        if direction_present:
+            sort_direction = self._resolve_sort_direction(
+                node.args["sortDirection"], node.name
+            )
+
+        if page_present and not size_present:
+            raise PlanError(
+                "InvalidQuery",
+                f"argument 'page' on root field '{node.name}' requires 'pageSize'",
+            )
+        if direction_present and not order_present:
+            raise PlanError(
+                "InvalidQuery",
+                f"argument 'sortDirection' on root field '{node.name}' "
+                f"requires 'orderBy'",
+            )
+        return {
+            "page": page,
+            "pageSize": page_size,
+            "orderBy": order_by,
+            "sortDirection": sort_direction,
+        }
+
+    def _resolve_paging_int(
+        self, arg_name: str, value: Any, allow_zero: bool
+    ) -> int:
+        """Resolve page/pageSize, validating literal/variable integer values.
+
+        Static literals fail with InvalidQuery; variable-provided values fail
+        with VariablesError. A nullable variable resolving to null is likewise
+        a VariablesError: paging positions require an actual integer.
+        """
+        from_var = isinstance(value, Var)
+        if from_var:
+            resolved = self._resolve(value)
+        else:
+            resolved = value
+        if isinstance(resolved, bool) or not isinstance(resolved, int):
+            raise PlanError(
+                "VariablesError" if from_var else "InvalidQuery",
+                f"argument '{arg_name}' must be an integer",
+            )
+        if resolved < 0 or (not allow_zero and resolved == 0):
+            raise PlanError(
+                "VariablesError" if from_var else "InvalidQuery",
+                f"argument '{arg_name}' has an invalid value {resolved}",
+            )
+        return resolved
+
+    def _resolve_order_by(self, value: Any, target: TypeInfo) -> str:
+        """Resolve orderBy to a sortable, non-null root-entity field name."""
+        from_var = isinstance(value, Var)
+        if from_var:
+            resolved = self._resolve(value)
+        else:
+            resolved = value
+        # EnumLiteral is a str subclass, so an unquoted field name behaves the
+        # same as the quoted string it resolves to in filter positions.
+        if not isinstance(resolved, str):
+            raise PlanError(
+                "VariablesError" if from_var else "InvalidQuery",
+                "argument 'orderBy' must be a field name string",
+            )
+        self._check_order_field(resolved, target, from_var)
+        return str(resolved)
+
+    def _check_order_field(self, name: str, target: TypeInfo, from_var: bool) -> None:
+        """Reject orderBy targets that are unknown, nullable, list or composite."""
+        code = "VariablesError" if from_var else "InvalidQuery"
+        order_field = target.fields.get(name)
+        if order_field is None:
+            raise PlanError(
+                code,
+                f"orderBy field '{name}' is not a field of type '{target.name}'",
+            )
+        if _is_list_type(order_field.type_ref):
+            raise PlanError(
+                code, f"orderBy field '{name}' must not be a list field"
+            )
+        if order_field.type_ref[0] != "non_null":
+            raise PlanError(code, f"orderBy field '{name}' must be non-null")
+        named = named_of(order_field.type_ref)
+        if (
+            named not in ("Int", "Float", "String", "ID", "Boolean")
+            and named not in self.schema.enums
+        ):
+            raise PlanError(
+                code,
+                f"orderBy field '{name}' must be a non-list scalar or enum field",
+            )
+
+    def _resolve_sort_direction(self, value: Any, field_name: str) -> str:
+        from_var = isinstance(value, Var)
+        if from_var:
+            resolved = self._resolve(value)
+        else:
+            resolved = value
+        if not isinstance(resolved, str) or str(resolved) not in SORT_DIRECTIONS:
+            raise PlanError(
+                "VariablesError" if from_var else "InvalidQuery",
+                f"argument 'sortDirection' on root field '{field_name}' must "
+                f"be ASC or DESC",
+            )
+        return str(resolved)
 
     # -- entry point ---------------------------------------------------------
 
@@ -284,8 +434,17 @@ class Planner:
                     "UnknownField",
                     f"missing required argument '{arg_name}' on root field '{node.name}'",
                 )
+        is_list = _is_list_type(field.type_ref)
+        paging = self._compile_paging(node, field, target) if is_list else None
         filter_obj: Dict[str, Any] = {}
         for arg_name, value in node.args.items():
+            if paging is not None and arg_name in PAGING_ARG_NAMES:
+                if arg_name in field.args:
+                    continue
+                raise PlanError(
+                    "UnknownField",
+                    f"unknown argument '{arg_name}' on root field '{node.name}'",
+                )
             if arg_name not in field.args:
                 raise PlanError(
                     "UnknownField",
@@ -300,7 +459,16 @@ class Planner:
                     f"argument '{arg_name}' does not match a filterable field of entity '{entity.table}'",
                 )
             filter_obj[arg_name] = self._resolve(value)
-        entry = {"path": key, "entity": entity.table, "filter": filter_obj, "fields": []}
+        entry = {
+            "path": key,
+            "entity": entity.table,
+            "filter": filter_obj,
+            "fields": [],
+            "page": paging["page"] if paging else 0,
+            "pageSize": paging["pageSize"] if paging else None,
+            "orderBy": paging["orderBy"] if paging else None,
+            "sortDirection": paging["sortDirection"] if paging else "ASC",
+        }
         self._walk(target, entity, node.selection_set, key, entry)
         return entry
 
