@@ -12,6 +12,7 @@ from .errors import PlanError
 from .gql import Directive, TypeRef, parse_schema_document
 
 BUILTIN_SCALARS = frozenset({"Int", "Float", "String", "Boolean", "ID"})
+BUILTIN_SCALAR_ORDER = ("Int", "Float", "String", "Boolean", "ID")
 
 
 def named_of(type_ref: TypeRef) -> str:
@@ -45,20 +46,35 @@ class FieldInfo:
 class TypeInfo:
     __slots__ = ("name", "fields", "interfaces", "entity")
 
-    def __init__(self, name: str, interfaces: List[str]):
+    def __init__(self, name: str, interfaces: Optional[List[str]] = None):
         self.name = name
         self.fields: Dict[str, FieldInfo] = {}
-        self.interfaces = interfaces
+        self.interfaces: List[str] = interfaces if interfaces is not None else []
         self.entity: Optional[Entity] = None
+
+
+class DirectiveInfo:
+    __slots__ = ("name", "args", "repeatable", "locations")
+
+    def __init__(self, name, args, repeatable, locations):
+        self.name = name
+        self.args: Dict[str, object] = args
+        self.repeatable = repeatable
+        self.locations = locations
 
 
 class Schema:
     def __init__(self):
         self.types: Dict[str, TypeInfo] = {}
         self.scalars = set(BUILTIN_SCALARS)
+        self.scalar_order: List[str] = list(BUILTIN_SCALAR_ORDER)
         self.enums = set()
+        self.enum_values: Dict[str, List[str]] = {}
         self.inputs: Dict[str, Dict[str, object]] = {}
         self.interfaces = set()
+        self.interface_types: Dict[str, TypeInfo] = {}
+        self.directives: Dict[str, DirectiveInfo] = {}
+        self.directive_order: List[str] = []
         self.unions: Dict[str, List[str]] = {}
         self.roots: Dict[str, str] = {}  # "query" | "mutation" | "subscription" -> type name
 
@@ -84,9 +100,33 @@ def load_schema(text: str, source: str = "<schema>") -> Schema:
     doc = parse_schema_document(text, source)
     schema = Schema()
     schema.scalars |= set(doc.scalars)
-    schema.enums = set(doc.enums)
+    schema.scalar_order.extend(doc.scalars)
+    schema.enums = {enum_def.name for enum_def in doc.enums}
+    schema.enum_values = {
+        enum_def.name: list(enum_def.values) for enum_def in doc.enums
+    }
     schema.interfaces = {tdef.name for tdef in doc.interfaces}
     schema.unions = dict(doc.unions)
+
+    for directive_def in doc.directives:
+        if directive_def.name in schema.directives:
+            raise _mapping_error(
+                f"duplicate directive definition '@{directive_def.name}'"
+            )
+        args: Dict[str, object] = {}
+        for adef in directive_def.args:
+            if adef.name in args:
+                raise _mapping_error(
+                    f"duplicate argument '{adef.name}' on '@{directive_def.name}'"
+                )
+            args[adef.name] = adef
+        schema.directives[directive_def.name] = DirectiveInfo(
+            directive_def.name,
+            args,
+            directive_def.repeatable,
+            list(directive_def.locations),
+        )
+        schema.directive_order.append(directive_def.name)
 
     for input_def in doc.inputs:
         if input_def.name in schema.inputs:
@@ -145,11 +185,36 @@ def load_schema(text: str, source: str = "<schema>") -> Schema:
             info.entity = _build_entity(schema, info, entity_directives[0])
         schema.types[name] = info
 
+    _build_interface_types(schema, doc.interfaces)
+
     _validate_type_references(schema)
     _validate_links(schema)
     _validate_entity_tables(schema)
     _resolve_roots(schema, doc.roots)
     return schema
+
+
+def _build_interface_types(schema: Schema, interface_defs: List) -> None:
+    for tdef in interface_defs:
+        info = TypeInfo(tdef.name, list(tdef.interfaces))
+        for fdef in tdef.fields:
+            if fdef.name in info.fields:
+                raise _mapping_error(
+                    f"duplicate field '{fdef.name}' on interface '{tdef.name}'"
+                )
+            args: Dict[str, object] = {}
+            for adef in fdef.args:
+                if adef.name in args:
+                    raise _mapping_error(
+                        f"duplicate argument '{adef.name}' on "
+                        f"'{tdef.name}.{fdef.name}'"
+                    )
+                args[adef.name] = adef
+            link_directives = [d for d in fdef.directives if d.name == "link"]
+            info.fields[fdef.name] = FieldInfo(
+                fdef.name, fdef.type, args, link_directives
+            )
+        schema.interface_types[tdef.name] = info
 
 
 def _normalize_field_list(value, what: str) -> Tuple[List[str], bool]:

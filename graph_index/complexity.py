@@ -211,7 +211,10 @@ class ComplexityCalculator(Planner):
         return 0
 
     def _walk_field(self, node: FieldNode, info: TypeInfo, stack: List[str]) -> int:
-        if node.name in ("__schema", "__type"):
+        # Introspection fields and the implicit __typename field always cost 0,
+        # including their sub-selections; they are available whether or not
+        # complexity control is enabled.
+        if node.name in ("__schema", "__type", "__typename"):
             return 0
         field = info.fields.get(node.name)
         if field is None:

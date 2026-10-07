@@ -19,11 +19,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import PlanError
 from .gql import Var, parse_executable
+from .introspection import (
+    IntroCompiler,
+    render_schema_root,
+    render_type_root,
+)
 from .planner import Planner
 from .schema import Entity, Schema, TypeInfo, named_of
 from .subscription import EVENT_OPS, _OrderedStore, _is_list_type
 
 _MISSING = object()
+
+STRING_TYPE = ("named", "String")
 
 
 class ExecNode:
@@ -46,6 +53,7 @@ class ExecNode:
         "target_types",
         "target_table",
         "children",
+        "type_name",
     )
 
     def __init__(
@@ -61,6 +69,7 @@ class ExecNode:
         target_types: Optional[List[Any]] = None,
         target_table: Optional[str] = None,
         children: Optional[List["ExecNode"]] = None,
+        type_name: Optional[str] = None,
     ):
         self.response_key = response_key
         self.field_name = field_name
@@ -73,6 +82,8 @@ class ExecNode:
         self.target_types = target_types
         self.target_table = target_table
         self.children = children
+        # Set for the implicit __typename field: the object type to report.
+        self.type_name = type_name
 
 
 class ExecContext:
@@ -131,12 +142,28 @@ class QueryCompiler(Planner):
         roots: List[dict] = []
         self.entity_keys = {}
         self.key_types = {}
+        intro = IntroCompiler(self.schema, self._resolve, self.fragments)
         for node in selections:
-            # Introspection root fields cost 0 and are only recognized while
-            # complexity control is enabled; the engine models no introspection
-            # data, so such a root resolves deterministically to null.
-            if self.bound_args_allowed and node.name in ("__schema", "__type"):
-                roots.append({"introspection": node.alias or node.name})
+            key = node.alias or node.name
+            # The implicit __typename meta-field may be selected on any object
+            # type, including the query root; it reports the object type name.
+            if node.name == "__typename":
+                IntroCompiler.validate_typename(node)
+                roots.append(
+                    {"typename_introspection": key, "name": root_type.name}
+                )
+                continue
+            # Introspection roots cost 0, never touch the entity snapshots and
+            # are available with or without complexity control.
+            if node.name == "__schema":
+                tree = intro.compile_schema_root(node, key)
+                roots.append({"schema_introspection": key, "tree": tree})
+                continue
+            if node.name == "__type":
+                type_name, tree = intro.compile_type_root(node, key)
+                roots.append(
+                    {"type_introspection": key, "tree": tree, "name": type_name}
+                )
                 continue
             roots.append(self._compile_root(node, root_type))
         return op.name, roots
@@ -253,6 +280,30 @@ class QueryCompiler(Planner):
         for node in selections:
             key = node.alias or node.name
             node_path = f"{path}.{key}"
+            if node.name == "__schema" or node.name == "__type":
+                raise PlanError(
+                    "InvalidQuery",
+                    f"introspection field '{node.name}' may only be selected "
+                    f"on the root query type",
+                )
+            if node.name == "__typename":
+                if node.args:
+                    raise PlanError(
+                        "InvalidQuery",
+                        "field '__typename' does not take arguments",
+                    )
+                if node.selection_set is not None:
+                    raise PlanError(
+                        "InvalidQuery",
+                        "field '__typename' must not have a selection set",
+                    )
+                if key not in seen:
+                    seen.add(key)
+                    children.append(
+                        ExecNode(key, "__typename", STRING_TYPE,
+                                 type_name=info.name)
+                    )
+                continue
             field = info.fields.get(node.name)
             if field is None:
                 raise PlanError(
@@ -498,10 +549,18 @@ def execute(roots: List[dict], ctx: ExecContext) -> Dict[str, Any]:
     """Answer the compiled query against the current snapshot stores."""
     data: Dict[str, Any] = {}
     for root in roots:
-        if "introspection" in root:
-            # No introspection data is modeled; a cost-0 introspection root is
-            # answered deterministically with null.
-            data[root["introspection"]] = None
+        if "typename_introspection" in root:
+            data[root["typename_introspection"]] = root["name"]
+            continue
+        if "schema_introspection" in root:
+            data[root["schema_introspection"]] = render_schema_root(
+                root["tree"], ctx.schema
+            )
+            continue
+        if "type_introspection" in root:
+            data[root["type_introspection"]] = render_type_root(
+                root["tree"], root["name"], ctx.schema
+            )
             continue
         data[root["response_key"]] = _execute_root(root, ctx)
     return {"data": data}
@@ -557,6 +616,9 @@ def _project(
     data: Dict[str, Any] = {}
     for node in nodes:
         node_path = f"{path}.{node.response_key}"
+        if node.field_name == "__typename":
+            data[node.response_key] = node.type_name
+            continue
         if node.children is None:
             if node.field_name not in snapshot:
                 raise PlanError(

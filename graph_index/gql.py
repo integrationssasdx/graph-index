@@ -30,6 +30,16 @@ class Var:
     name: str
 
 
+class EnumLiteral(str):
+    """An unquoted enum literal in an argument or default-value position.
+
+    It subclasses ``str`` so the existing filter/variable paths treat it
+    exactly like the bare string it has always resolved to, while callers
+    that require a String literal (introspection ``name``) can detect and
+    reject it.
+    """
+
+
 @dataclass
 class Directive:
     name: str
@@ -65,6 +75,20 @@ class ObjectTypeDef:
 class InputDef:
     name: str
     fields: List[InputValueDef]
+
+
+@dataclass
+class EnumDef:
+    name: str
+    values: List[str]
+
+
+@dataclass
+class DirectiveDef:
+    name: str
+    args: List[InputValueDef]
+    repeatable: bool
+    locations: List[str]
 
 
 @dataclass
@@ -340,7 +364,7 @@ class Parser:
                 return False
             if tok.value == "null":
                 return None
-            return tok.value  # enum value
+            return EnumLiteral(tok.value)  # enum value
         if self.eat_punct("["):
             items = []
             while not self.eat_punct("]"):
@@ -479,7 +503,8 @@ class SdlDocument:
         self.interfaces: List[ObjectTypeDef] = []
         self.inputs: List[InputDef] = []
         self.scalars: List[str] = []
-        self.enums: List[str] = []
+        self.enums: List[EnumDef] = []
+        self.directives: List[DirectiveDef] = []
         self.unions: Dict[str, List[str]] = {}
         self.roots: Dict[str, str] = {}
         self.schema_seen = False
@@ -580,14 +605,16 @@ def parse_schema_document(text: str, source: str) -> SdlDocument:
             doc.inputs.append(InputDef(name, fields))
         elif parser.at_name("enum"):
             parser.advance()
-            doc.enums.append(parser.expect_name())
+            enum_name = parser.expect_name()
             parser.parse_directives(const=True)
+            enum_values: List[str] = []
             if parser.eat_punct("{"):
                 while not parser.eat_punct("}"):
                     if parser.peek().kind == "string":
                         parser.advance()
-                    parser.expect_name()
+                    enum_values.append(parser.expect_name())
                     parser.parse_directives(const=True)
+            doc.enums.append(EnumDef(enum_name, enum_values))
         elif parser.at_name("union"):
             parser.advance()
             union_name = parser.expect_name()
@@ -602,19 +629,28 @@ def parse_schema_document(text: str, source: str) -> SdlDocument:
         elif parser.at_name("directive"):
             parser.advance()
             parser.expect_punct("@")
-            parser.expect_name()
+            directive_name = parser.expect_name()
+            directive_args: List[InputValueDef] = []
             if parser.eat_punct("("):
                 while not parser.eat_punct(")"):
-                    _parse_input_value_def(parser)
+                    if parser.peek().kind == "string":
+                        parser.advance()
+                    directive_args.append(_parse_input_value_def(parser))
+            repeatable = False
             if parser.at_name("repeatable"):
                 parser.advance()
+                repeatable = True
             if not parser.at_name("on"):
                 parser.error("expected 'on' in directive definition")
             parser.advance()
             parser.eat_punct("|")
-            parser.expect_name()
+            locations: List[str] = []
+            locations.append(parser.expect_name())
             while parser.eat_punct("|"):
-                parser.expect_name()
+                locations.append(parser.expect_name())
+            doc.directives.append(
+                DirectiveDef(directive_name, directive_args, repeatable, locations)
+            )
         elif parser.at_name("extend"):
             parser.advance()
             if parser.at_name("type"):

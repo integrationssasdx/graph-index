@@ -267,16 +267,18 @@ class CliCase(unittest.TestCase):
             complexity=2, limit=1)
 
     def test_introspection_fields_cost_zero(self):
-        # Pure introspection passes even a limit of 1 and resolves to null.
+        # Pure introspection passes even a limit of 1 and still returns the
+        # requested type-system metadata.
         payload = self.assert_data_ok(
             *self.run_cli('{ __schema { queryType { name } } }', limit=1))
-        self.assertIsNone(payload["data"]["__schema"])
+        self.assertEqual(
+            payload["data"]["__schema"], {"queryType": {"name": "Query"}})
 
     def test_introspection_zero_plus_entity_shares_limit(self):
         payload = self.assert_data_ok(
             *self.run_cli(
                 '{ __type(name: "User") { name } user { id } }', limit=1))
-        self.assertIsNone(payload["data"]["__type"])
+        self.assertEqual(payload["data"]["__type"], {"name": "User"})
         self.assertEqual(payload["data"]["user"], {"id": 1})
 
     # -- list bounds ----------------------------------------------------------

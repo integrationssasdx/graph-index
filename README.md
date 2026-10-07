@@ -10,7 +10,17 @@
 
 - `graph-index query-plan`：将 GraphQL 查询编译为实体扫描/连接计划。
 - `graph-index subscription-push --schema <schema.graphql> --subscription <subscription.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：将订阅编译为实体等值过滤与字段投影（支持叶字段以及经 @link 到达的一层或多层嵌套对象字段与嵌套列表字段，含别名与片段展开），按序匹配 NDJSON 实体变更事件（INSERT/UPDATE/DELETE）。处理时先逐行解析校验，再按实体主键维护各实体最新快照（INSERT/UPDATE 保存 after，DELETE 删除 before 对应实体）；对象字段按 @link 的 local→target 顺序从截至当前行的最新目标快照取单个对象，任一 local 为 null 时关系为 null（非空对象字段则以 EventError 结束）；列表字段将目标表当前快照中 target 值与源 local 值等值匹配的实体全部收集，按目标首次 INSERT/UPDATE 入库的顺序排列（UPDATE 原位替换，DELETE 后重新 INSERT 排到末尾），任一 local 为 null 或无匹配时输出空数组，列表 @link 的 target 不必是目标实体主键（但 local/target 字段均须为标量）。成功时向 stdout 输出 JSONL（字段：`subscription`、`path`、`event`、`entity`、`data`），失败时向 stderr 输出 `{code, message}` 并以退出码 2 结束（stdout 不输出部分结果）。
-- `graph-index query-exec --schema <schema.graphql> --query <query.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：对实体变更快照直接执行一次 GraphQL 查询。事件先逐行解析校验，再按 INSERT、UPDATE、DELETE 顺序维护各查询可达实体的主键当前快照（INSERT/UPDATE 保存 after，DELETE 按 before 移除）；只执行 query，mutation/subscription 以 `UnsupportedOperation` 结束。根参数按映射实体标量字段等值过滤：列表根返回全部匹配行（快照首次入库顺序，UPDATE 原位替换，DELETE 后重插排末尾），单实体根零匹配返回 `null`、多匹配以 `QueryError` 结束。单对象 @link 的 local 按声明顺序指向目标实体主键：任一 local 为 null 时关系为 null（字段非空则 `EventError`），local 非 null 而目标不存在亦为 `EventError`；列表 @link 以 local 与 target 标量值等值匹配（target 无须是主键），无匹配或 local 含 null 返回空数组，并按目标首次入库顺序排列。别名、变量默认值、片段展开与复合主键沿用 query-plan 语义。事件结构、op、before/after、实体主键或投影快照（含字段值与 schema 声明形状不兼容）不合约定以 `EventError` 结束；GraphQL、变量、映射与连接声明的非法输入沿用既有错误码。成功时向 stdout 输出一次 GraphQL 响应（顶层 `data`），失败时向 stderr 输出单个 `{code, message}` 并以退出码 2 结束（stdout 无部分结果）。
+- `graph-index query-exec --schema <schema.graphql> --query <query.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：对实体变更快照直接执行一次 GraphQL 查询。事件先逐行解析校验，再按 INSERT、UPDATE、DELETE 顺序维护各查询可达实体的主键当前快照（INSERT/UPDATE 保存 after，DELETE 按 before 移除）；只执行 query，mutation/subscription 以 `UnsupportedOperation` 结束。根参数按映射实体标量字段等值过滤：列表根返回全部匹配行（快照首次入库顺序，UPDATE 原位替换，DELETE 后重插排末尾），单实体根零匹配返回 `null`、多匹配以 `QueryError` 结束。单对象 @link 的 local 按声明顺序指向目标实体主键：任一 local 为 null 时关系为 null（字段非空则 `EventError`），local 非 null 而目标不存在亦为 `EventError`；列表 @link 以 local 与 target 标量值等值匹配（target 无须是主键），无匹配或 local 含 null 返回空数组，并按目标首次入库顺序排列。别名、变量默认值、片段展开与复合主键沿用 query-plan 语义。除实体根字段外，query 文档还支持 GraphQL 内省：根级 `__schema`、`__type(name: String!)`，以及任意对象选择集中的 `__typename`（详见下节「GraphQL 内省」）。事件结构、op、before/after、实体主键或投影快照（含字段值与 schema 声明形状不兼容）不合约定以 `EventError` 结束；GraphQL、变量、映射与连接声明的非法输入沿用既有错误码。成功时向 stdout 输出一次 GraphQL 响应（顶层 `data`），失败时向 stderr 输出单个 `{code, message}` 并以退出码 2 结束（stdout 无部分结果）。
+
+## GraphQL 内省
+
+`query-exec` 在不改动实体查询入口与错误码的前提下实现标准 GraphQL introspection（`query-plan` 与 `subscription-push` 的既有行为不变，不识别这些元字段）：
+
+- `__schema` 返回 `__Schema`：`queryType`/`mutationType`/`subscriptionType`（未声明的根类型返回 `null`）、`types`（全部内置标量、自定义标量、object、interface、union、enum、input object 及内省元类型，顺序确定、不重复）与 `directives`（内置 `skip`/`include`/`deprecated`/`specifiedBy` 加 SDL 中声明的 directive，含 `args`、`locations`、`isRepeatable`）。
+- `__type(name: String!)` 按名称返回对应 `__Type`，未知名称返回 `null`。各类型 `kind`（SCALAR/OBJECT/INTERFACE/UNION/ENUM/INPUT_OBJECT/LIST/NON_NULL）、`name`、LIST/NON_NULL 的 `ofType` 包装结构，以及可展开关系均为确定结果：object/interface 的 `fields`（含参数 `args`、参数 `defaultValue` 字符串、字段 `type` 包装）与 `interfaces`；interface/union 的 `possibleTypes`；enum 的 `enumValues`；input object 的 `inputFields`。与当前类型 kind 不适用的关系字段返回 `null`；未请求的字段一律不出现在结果中。`defaultValue` 以 GraphQL 常量值语法的字符串形式给出。描述与弃用未在 SDL 中建模，故 `description`/`deprecationReason`/`specifiedByURL` 为 `null`，`isDeprecated` 恒为 `false`，`includeDeprecated` 参数被接受但不影响结果。
+- `__typename` 可出现在任意对象（含 query 根、内省元类型对象）选择集中，返回该对象类型的名称；别名、片段展开沿用实体选择的既有合并语义。
+- `__schema` 不接受实参且必须带 selection set；`__type` 必须提供 `name` 且不接受其他实参，`name` 字面量必须是 String（枚举名/数字/布尔等非 String 字面量）或类型为 String 的变量；内省字段上出现未声明实参、缺少 selection set、在非根对象上选择 `__schema`/`__type`、给 `__typename` 传参数或附加 selection set，均以 `InvalidQuery` 结束（元类型上的未知字段仍为 `UnknownField`）。`name` 由变量提供但变量缺失、未声明或类型不符时以 `VariablesError` 结束。
+- 内省与 `__typename` 在复杂度控制关闭时同样可用；控制开启时复杂度均为 0，已有 `QUERY_COMPLEXITY_EXCEEDED` 判定不变。只含根级内省/`__typename` 的查询仍要求 `--events` 文件可读，但不解析也不折叠其中事件；与实体根字段混合时，实体部分继续按当前快照、连接与顺序执行，事件仍逐行解析校验。
 
 ## 查询复杂度控制
 
@@ -21,7 +31,7 @@
 - 从 operation 根 selection set 开始；每个叶子字段计 1，组合字段只累计其子 selection（对象容器自身计 0）；
 - 重复字段与不同 alias 分别计分（即便执行阶段按 response key 合并，复杂度仍按原始选择逐个计）；
 - fragment 在展开位置计入一次（同一 fragment 展开两处即计两处），inline fragment 直接计入其选择；类型条件不匹配当前类型的片段计 0；
-- 内省字段 `__schema`、`__type` 计 0；
+- 内省字段 `__schema`、`__type` 以及隐式元字段 `__typename` 计 0；
 - 列表字段按有效条目上界放大其子 selection：优先读取字段参数 `first`，其次 `limit` 的正整数面值，也接受对应变量（含变量默认值）的正整数值；参数缺失、值非正或非整数时按 `1000` 计。变量本身的 GraphQL 类型校验仍由既有校验阶段负责（类型不符仍为 `VariablesError`）。嵌套列表的上界逐层相乘。
 
 判定确定：复杂度等于上限时允许执行并沿用既有查询路径、数据结构与顺序；严格大于上限时不调用解析器、不读取索引实体（query-exec 不再折叠事件）、不建立订阅（subscription-push 不产生任何推送），也没有持久化副作用。此时 query-exec 在 stdout 输出一次 GraphQL 响应、退出码 0：`data` 为 `null`，`errors` 恰有一个，其 `extensions.code` 为 `QUERY_COMPLEXITY_EXCEEDED`；subscription-push 以同一 GraphQL 响应代替 JSONL 输出。查询计划产生的分批取数不重复计费，订阅建立后推送的数据也不再次计费。

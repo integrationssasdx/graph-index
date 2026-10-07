@@ -111,7 +111,10 @@ def _cmd_query_exec(args, complexity_limit) -> dict:
             complexity_limit,
         )
     ctx = ExecContext(schema, compiler.entity_keys, compiler.key_types)
-    fold_events(ctx, events_text, args.events)
+    # A query that only asks for introspection/meta-fields still requires the
+    # events file to be readable, but its events are never parsed or folded.
+    if any("response_key" in root for root in roots):
+        fold_events(ctx, events_text, args.events)
     return execute(roots, ctx)
 
 
