@@ -12,6 +12,18 @@
 - `graph-index subscription-push --schema <schema.graphql> --subscription <subscription.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：将订阅编译为实体等值过滤与字段投影（支持叶字段以及经 @link 到达的一层或多层嵌套对象字段与嵌套列表字段，含别名与片段展开），按序匹配 NDJSON 实体变更事件（INSERT/UPDATE/DELETE）。处理时先逐行解析校验，再按实体主键维护各实体最新快照（INSERT/UPDATE 保存 after，DELETE 删除 before 对应实体）；对象字段按 @link 的 local→target 顺序从截至当前行的最新目标快照取单个对象，任一 local 为 null 时关系为 null（非空对象字段则以 EventError 结束）；列表字段将目标表当前快照中 target 值与源 local 值等值匹配的实体全部收集，按目标首次 INSERT/UPDATE 入库的顺序排列（UPDATE 原位替换，DELETE 后重新 INSERT 排到末尾），任一 local 为 null 或无匹配时输出空数组，列表 @link 的 target 不必是目标实体主键（但 local/target 字段均须为标量）。成功时向 stdout 输出 JSONL（字段：`subscription`、`path`、`event`、`entity`、`data`），失败时向 stderr 输出 `{code, message}` 并以退出码 2 结束（stdout 不输出部分结果）。
 - `graph-index query-exec --schema <schema.graphql> --query <query.graphql> --variables <variables.json> --events <events.ndjson> [--operation <name>]`：对实体变更快照直接执行一次 GraphQL 查询。事件先逐行解析校验，再按 INSERT、UPDATE、DELETE 顺序维护各查询可达实体的主键当前快照（INSERT/UPDATE 保存 after，DELETE 按 before 移除）；只执行 query，mutation/subscription 以 `UnsupportedOperation` 结束。根参数按映射实体标量字段等值过滤：列表根返回全部匹配行（快照首次入库顺序，UPDATE 原位替换，DELETE 后重插排末尾），单实体根零匹配返回 `null`、多匹配以 `QueryError` 结束。单对象 @link 的 local 按声明顺序指向目标实体主键：任一 local 为 null 时关系为 null（字段非空则 `EventError`），local 非 null 而目标不存在亦为 `EventError`；列表 @link 以 local 与 target 标量值等值匹配（target 无须是主键），无匹配或 local 含 null 返回空数组，并按目标首次入库顺序排列。别名、变量默认值、片段展开与复合主键沿用 query-plan 语义。事件结构、op、before/after、实体主键或投影快照（含字段值与 schema 声明形状不兼容）不合约定以 `EventError` 结束；GraphQL、变量、映射与连接声明的非法输入沿用既有错误码。成功时向 stdout 输出一次 GraphQL 响应（顶层 `data`），失败时向 stderr 输出单个 `{code, message}` 并以退出码 2 结束（stdout 无部分结果）。
 
+## GraphQL introspection（仅 query-exec）
+
+query-exec 在根选择集公开标准内省字段 `__schema` 与 `__type(name: String!)`，并允许在任意对象选择集（含查询根对象）中选择 `__typename`；query-plan 与 subscription-push 不识别这些字段，沿用既有报错。
+
+- `__schema` 返回标准内省模型：`queryType`/`mutationType`/`subscriptionType`（对应根类型不存在时为 `null`）、全部 `types`（对象、接口、联合、枚举、输入对象、自定义标量、内建标量与内省内省类型）、标准 `directives`（`skip`/`include`/`deprecated`）。
+- `__Type` 按类型种类返回确定结果：OBJECT/INTERFACE 的 `fields`（含 `args`、`type` 包装链与参数 `defaultValue`）、`interfaces`/`possibleTypes`、UNION 的 `possibleTypes`、ENUM 的 `enumValues`、INPUT_OBJECT 的 `inputFields`、SCALAR 的这些关系一律为 `null`；`ofType` 仅在 LIST/NON_NULL 包装类型上非空。`__type(name:)` 按名称返回对应类型，名称未知时返回 `null`。
+- 输出严格按选择集裁剪：未请求的字段不出现；被请求但对当前种类不适用的关系按标准返回 `null`。
+- `__typename` 在根对象返回查询根类型名，在实体对象上返回该对象类型名，支持别名与片段展开；内省选择集内的 `__typename` 返回内省类型名（如 `__Schema`、`__Type`）。
+- 非法用法一律以 `InvalidQuery` 结束：`__type` 缺少 `name` 实参或字面量不是 String（数字、布尔、null、枚举字面量）、给 `__schema` 传实参或给内省字段传未声明实参（仅 `__Type.fields(includeDeprecated:)` 与 `__Type.enumValues(includeDeprecated:)` 合法）、内省对象字段缺少选择集或叶子字段带选择集、在非根对象上选择 `__schema`/`__type`、给 `__typename` 传参数或附加选择集。`name` 或内省布尔实参由变量提供时，变量缺失/未声明/声明类型不符（如 `Int`、`ID`、`[String]`）以 `VariablesError` 结束；变量值合法但为 null 时仍为 `InvalidQuery`。
+- 内省字段与 `__typename` 在复杂度控制关闭时同样可用；控制开启时复杂度均为 0，既有 `QUERY_COMPLEXITY_EXCEEDED` 判定不变。
+- 只选择内省字段与根级 `__typename` 的查询仍要求 events 文件可读（缺失为 `IoError`），但不解析、不折叠其中的事件；混合实体根字段时，实体部分继续按当前快照、连接与顺序执行，事件文件仍逐行校验。
+
 ## 查询复杂度控制
 
 通过环境变量 `GRAPHQL_QUERY_COMPLEXITY_LIMIT` 在服务启动时开启：变量缺省或值为 `0` 时功能关闭；值为正整数时为单次 operation 的最大复杂度；负数、非整数或无法解析的值使启动失败（不执行任何命令），向 stderr 输出 `{code: "INVALID_QUERY_COMPLEXITY_LIMIT", message}` 并以退出码 2 结束。
@@ -21,7 +33,7 @@
 - 从 operation 根 selection set 开始；每个叶子字段计 1，组合字段只累计其子 selection（对象容器自身计 0）；
 - 重复字段与不同 alias 分别计分（即便执行阶段按 response key 合并，复杂度仍按原始选择逐个计）；
 - fragment 在展开位置计入一次（同一 fragment 展开两处即计两处），inline fragment 直接计入其选择；类型条件不匹配当前类型的片段计 0；
-- 内省字段 `__schema`、`__type` 计 0；
+- 内省字段 `__schema`、`__type` 以及 `__typename` 计 0；
 - 列表字段按有效条目上界放大其子 selection：优先读取字段参数 `first`，其次 `limit` 的正整数面值，也接受对应变量（含变量默认值）的正整数值；参数缺失、值非正或非整数时按 `1000` 计。变量本身的 GraphQL 类型校验仍由既有校验阶段负责（类型不符仍为 `VariablesError`）。嵌套列表的上界逐层相乘。
 
 判定确定：复杂度等于上限时允许执行并沿用既有查询路径、数据结构与顺序；严格大于上限时不调用解析器、不读取索引实体（query-exec 不再折叠事件）、不建立订阅（subscription-push 不产生任何推送），也没有持久化副作用。此时 query-exec 在 stdout 输出一次 GraphQL 响应、退出码 0：`data` 为 `null`，`errors` 恰有一个，其 `extensions.code` 为 `QUERY_COMPLEXITY_EXCEEDED`；subscription-push 以同一 GraphQL 响应代替 JSONL 输出。查询计划产生的分批取数不重复计费，订阅建立后推送的数据也不再次计费。

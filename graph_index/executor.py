@@ -18,12 +18,27 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import PlanError
-from .gql import Var, parse_executable
+from .gql import EnumLiteral, Var, parse_executable
+from . import introspection
 from .planner import Planner
 from .schema import Entity, Schema, TypeInfo, named_of
 from .subscription import EVENT_OPS, _OrderedStore, _is_list_type
 
 _MISSING = object()
+
+
+def _is_string_variable(type_ref) -> bool:
+    """Whether a variable's declared type is String (optionally non-null)."""
+    if type_ref[0] == "non_null":
+        type_ref = type_ref[1]
+    return type_ref == ("named", "String")
+
+
+def _is_boolean_variable(type_ref) -> bool:
+    """Whether a variable's declared type is Boolean (optionally non-null)."""
+    if type_ref[0] == "non_null":
+        type_ref = type_ref[1]
+    return type_ref == ("named", "Boolean")
 
 
 class ExecNode:
@@ -40,6 +55,7 @@ class ExecNode:
         "field_type",
         "required",
         "is_list",
+        "typename",
         "local",
         "local_types",
         "target",
@@ -55,6 +71,7 @@ class ExecNode:
         field_type=None,
         required: bool = False,
         is_list: bool = False,
+        typename: Optional[str] = None,
         local: Optional[List[str]] = None,
         local_types: Optional[List[Any]] = None,
         target: Optional[List[str]] = None,
@@ -67,6 +84,9 @@ class ExecNode:
         self.field_type = field_type
         self.required = required
         self.is_list = is_list
+        # When set, this node projects the object type name instead of a
+        # snapshot field (the GraphQL ``__typename`` meta-field).
+        self.typename = typename
         self.local = local
         self.local_types = local_types
         self.target = target
@@ -132,14 +152,88 @@ class QueryCompiler(Planner):
         self.entity_keys = {}
         self.key_types = {}
         for node in selections:
-            # Introspection root fields cost 0 and are only recognized while
-            # complexity control is enabled; the engine models no introspection
-            # data, so such a root resolves deterministically to null.
-            if self.bound_args_allowed and node.name in ("__schema", "__type"):
-                roots.append({"introspection": node.alias or node.name})
+            if node.name == "__typename":
+                # __typename on the query root object names the root type.
+                if node.args:
+                    raise PlanError(
+                        "InvalidQuery", "'__typename' does not take arguments"
+                    )
+                if node.selection_set is not None:
+                    raise PlanError(
+                        "InvalidQuery",
+                        "'__typename' must not have a selection set",
+                    )
+                roots.append(
+                    {"typename_root": node.alias or node.name,
+                     "type_name": root_type.name}
+                )
+                continue
+            if node.name in ("__schema", "__type"):
+                # Introspection is always available (with or without complexity
+                # control); it neither reads entities nor costs complexity.
+                roots.append(
+                    introspection.compile_introspection_root(
+                        node,
+                        self.schema,
+                        self.fragments,
+                        self._coerce_type_name_arg,
+                        self._coerce_boolean_arg,
+                    )
+                )
                 continue
             roots.append(self._compile_root(node, root_type))
         return op.name, roots
+
+    # -- introspection argument coercion --------------------------------------
+
+    def _coerce_type_name_arg(self, value: Any) -> str:
+        """Coerce the ``__type(name:)`` argument to a String value.
+
+        A variable must be declared with a String type (mismatch is a
+        VariablesError); after resolution the value must be a non-null
+        String literal rather than an enum/boolean/null literal.
+        """
+        if isinstance(value, Var):
+            spec = self.var_map.get(value.name)
+            if spec is not None and not _is_string_variable(spec[0]):
+                raise PlanError(
+                    "VariablesError",
+                    f"variable '${value.name}' used for '__type' argument "
+                    f"'name' must be a String",
+                )
+        value = self._resolve(value)
+        if (
+            value is None
+            or isinstance(value, bool)
+            or isinstance(value, EnumLiteral)
+            or not isinstance(value, str)
+        ):
+            raise PlanError(
+                "InvalidQuery", "'__type' argument 'name' must be a String literal"
+            )
+        return value
+
+    def _coerce_boolean_arg(self, value: Any) -> bool:
+        """Coerce an introspection Boolean argument (includeDeprecated).
+
+        A variable must be declared with a Boolean type (mismatch is a
+        VariablesError); the resolved value must then be a boolean literal.
+        """
+        if isinstance(value, Var):
+            spec = self.var_map.get(value.name)
+            if spec is not None and not _is_boolean_variable(spec[0]):
+                raise PlanError(
+                    "VariablesError",
+                    f"variable '${value.name}' used for introspection "
+                    f"argument 'includeDeprecated' must be a Boolean",
+                )
+        value = self._resolve(value)
+        if not isinstance(value, bool):
+            raise PlanError(
+                "InvalidQuery",
+                "introspection argument 'includeDeprecated' must be a Boolean",
+            )
+        return value
 
     # -- operation selection ---------------------------------------------------
 
@@ -253,6 +347,28 @@ class QueryCompiler(Planner):
         for node in selections:
             key = node.alias or node.name
             node_path = f"{path}.{key}"
+            if node.name == "__typename":
+                if node.args:
+                    raise PlanError(
+                        "InvalidQuery", "'__typename' does not take arguments"
+                    )
+                if node.selection_set is not None:
+                    raise PlanError(
+                        "InvalidQuery",
+                        "'__typename' must not have a selection set",
+                    )
+                if key not in seen:
+                    seen.add(key)
+                    children.append(
+                        ExecNode(key, node.name, typename=info.name)
+                    )
+                continue
+            if node.name in ("__schema", "__type"):
+                raise PlanError(
+                    "InvalidQuery",
+                    f"introspection field '{node.name}' can only be selected "
+                    f"on the root query type",
+                )
             field = info.fields.get(node.name)
             if field is None:
                 raise PlanError(
@@ -498,10 +614,13 @@ def execute(roots: List[dict], ctx: ExecContext) -> Dict[str, Any]:
     """Answer the compiled query against the current snapshot stores."""
     data: Dict[str, Any] = {}
     for root in roots:
-        if "introspection" in root:
-            # No introspection data is modeled; a cost-0 introspection root is
-            # answered deterministically with null.
-            data[root["introspection"]] = None
+        if root.get("kind") == "introspection":
+            data[root["response_key"]] = introspection.resolve_introspection_root(
+                root, ctx.schema
+            )
+            continue
+        if "typename_root" in root:
+            data[root["typename_root"]] = root["type_name"]
             continue
         data[root["response_key"]] = _execute_root(root, ctx)
     return {"data": data}
@@ -557,6 +676,9 @@ def _project(
     data: Dict[str, Any] = {}
     for node in nodes:
         node_path = f"{path}.{node.response_key}"
+        if node.typename is not None:
+            data[node.response_key] = node.typename
+            continue
         if node.children is None:
             if node.field_name not in snapshot:
                 raise PlanError(

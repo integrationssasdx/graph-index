@@ -211,7 +211,7 @@ class ComplexityCalculator(Planner):
         return 0
 
     def _walk_field(self, node: FieldNode, info: TypeInfo, stack: List[str]) -> int:
-        if node.name in ("__schema", "__type"):
+        if node.name in ("__schema", "__type", "__typename"):
             return 0
         field = info.fields.get(node.name)
         if field is None:

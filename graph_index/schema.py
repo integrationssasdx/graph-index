@@ -57,8 +57,12 @@ class Schema:
         self.types: Dict[str, TypeInfo] = {}
         self.scalars = set(BUILTIN_SCALARS)
         self.enums = set()
+        # enum type name -> declared value names, in SDL order
+        self.enum_values: Dict[str, List[str]] = {}
         self.inputs: Dict[str, Dict[str, object]] = {}
         self.interfaces = set()
+        # interface name -> field name -> FieldInfo, in SDL order
+        self.interface_fields: Dict[str, Dict[str, FieldInfo]] = {}
         self.unions: Dict[str, List[str]] = {}
         self.roots: Dict[str, str] = {}  # "query" | "mutation" | "subscription" -> type name
 
@@ -84,9 +88,21 @@ def load_schema(text: str, source: str = "<schema>") -> Schema:
     doc = parse_schema_document(text, source)
     schema = Schema()
     schema.scalars |= set(doc.scalars)
-    schema.enums = set(doc.enums)
+    schema.enums = {edef.name for edef in doc.enums}
+    schema.enum_values = {edef.name: list(edef.values) for edef in doc.enums}
     schema.interfaces = {tdef.name for tdef in doc.interfaces}
     schema.unions = dict(doc.unions)
+
+    for idef in doc.interfaces:
+        fields = schema.interface_fields.setdefault(idef.name, {})
+        for fdef in idef.fields:
+            args: Dict[str, object] = {}
+            for adef in fdef.args:
+                args[adef.name] = adef
+            fields[fdef.name] = FieldInfo(
+                fdef.name, fdef.type, args,
+                [d for d in fdef.directives if d.name == "link"],
+            )
 
     for input_def in doc.inputs:
         if input_def.name in schema.inputs:

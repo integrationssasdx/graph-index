@@ -111,7 +111,10 @@ def _cmd_query_exec(args, complexity_limit) -> dict:
             complexity_limit,
         )
     ctx = ExecContext(schema, compiler.entity_keys, compiler.key_types)
-    fold_events(ctx, events_text, args.events)
+    # A pure introspection query must still be able to read the events file,
+    # but its lines are neither parsed nor folded into snapshots.
+    if any("table" in root for root in roots):
+        fold_events(ctx, events_text, args.events)
     return execute(roots, ctx)
 
 

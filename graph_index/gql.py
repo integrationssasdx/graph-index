@@ -30,6 +30,15 @@ class Var:
     name: str
 
 
+class EnumLiteral(str):
+    """An enum literal appearing in an executable/const document.
+
+    A bare ``str`` subclass so existing enum handling (equality against event
+    strings, JSON output) is unchanged, while string-literal validation can
+    tell an enum literal apart from a real String literal.
+    """
+
+
 @dataclass
 class Directive:
     name: str
@@ -65,6 +74,12 @@ class ObjectTypeDef:
 class InputDef:
     name: str
     fields: List[InputValueDef]
+
+
+@dataclass
+class EnumDef:
+    name: str
+    values: List[str]
 
 
 @dataclass
@@ -340,7 +355,7 @@ class Parser:
                 return False
             if tok.value == "null":
                 return None
-            return tok.value  # enum value
+            return EnumLiteral(tok.value)  # enum value
         if self.eat_punct("["):
             items = []
             while not self.eat_punct("]"):
@@ -479,7 +494,7 @@ class SdlDocument:
         self.interfaces: List[ObjectTypeDef] = []
         self.inputs: List[InputDef] = []
         self.scalars: List[str] = []
-        self.enums: List[str] = []
+        self.enums: List[EnumDef] = []
         self.unions: Dict[str, List[str]] = {}
         self.roots: Dict[str, str] = {}
         self.schema_seen = False
@@ -580,14 +595,17 @@ def parse_schema_document(text: str, source: str) -> SdlDocument:
             doc.inputs.append(InputDef(name, fields))
         elif parser.at_name("enum"):
             parser.advance()
-            doc.enums.append(parser.expect_name())
+            enum_name = parser.expect_name()
             parser.parse_directives(const=True)
+            enum_values: List[str] = []
             if parser.eat_punct("{"):
                 while not parser.eat_punct("}"):
                     if parser.peek().kind == "string":
                         parser.advance()
-                    parser.expect_name()
+                    value_name = parser.expect_name()
                     parser.parse_directives(const=True)
+                    enum_values.append(value_name)
+            doc.enums.append(EnumDef(enum_name, enum_values))
         elif parser.at_name("union"):
             parser.advance()
             union_name = parser.expect_name()
