@@ -11,6 +11,12 @@ List fields match every current target snapshot whose @link target field
 values equal the source's local field values; the matched targets are
 recursively projected in target insert order. The @link target of a list
 relationship need not be (part of) the target entity's primary key.
+
+Every event line is parsed and validated before the first snapshot changes.
+Besides a root entity's own INSERT/UPDATE/DELETE (pushed only while the
+snapshot matches the filter), an event on any entity reachable through the
+selected @link tree pushes a synthetic UPDATE for each still-matching root
+whose projected shape changed when the event was applied.
 """
 
 from __future__ import annotations
@@ -426,6 +432,11 @@ def push_events(
     Every line is parsed and validated first; the latest snapshot of each
     entity is then maintained by primary key, and matching root events are
     projected against the snapshots known up to and including that line.
+
+    An event on an entity reachable through the selected @link tree also
+    pushes a synthetic UPDATE for every root that still matches the filter
+    after the event and whose projected shape changed; the affected roots are
+    reported in their current snapshot insert order.
     """
     events: List[Tuple[int, Dict[str, Any]]] = []
     for lineno, raw in enumerate(events_text.splitlines(), 1):
@@ -437,16 +448,149 @@ def push_events(
     snapshots: Dict[str, _OrderedStore] = {}
     outputs: List[Dict[str, Any]] = []
     for lineno, event in events:
-        _apply_event(plan.entity_keys, snapshots, event)
-        if event["entity"] != plan.entity_table:
+        # Events on entities the selection tree cannot reach stay read-only:
+        # they neither change a store nor get to test a relationship.
+        if event["entity"] not in plan.entity_keys:
             continue
-        op = event["op"]
-        snapshot = event["after"] if op in ("INSERT", "UPDATE") else event["before"]
-        if snapshot is None:
-            raise PlanError(
-                "EventError", f"{source}:{lineno}: {op} event has no snapshot"
+        # Project every currently matching root against pre-event snapshots so
+        # the post-event comparison can tell an actual projection change from
+        # noise. This runs before the store mutates, so a malformed line ends
+        # the stream without partial output.
+        before_rows = _root_rows(plan, snapshots)
+        before_shapes: Dict[Any, Any] = {}
+        for identity, snapshot in before_rows:
+            if plan.matches(snapshot):
+                before_shapes[identity] = _project(
+                    plan.tree.children,
+                    snapshot,
+                    snapshots,
+                    plan.entity_keys,
+                    source,
+                    lineno,
+                    plan.path,
+                )
+        _apply_event(plan.entity_keys, snapshots, event)
+        excluded: Optional[set] = None
+        if event["entity"] == plan.entity_table:
+            direct_identity = _direct_identity(plan, snapshots, event)
+            excluded = {direct_identity}
+            output = _push_root_event(
+                plan, event, snapshots, source, lineno
             )
-        if not plan.matches(snapshot):
+            if output is not None:
+                outputs.append(output)
+        outputs.extend(
+            _push_dependency_changes(
+                plan,
+                snapshots,
+                source,
+                lineno,
+                before_shapes,
+                excluded,
+            )
+        )
+    return outputs
+
+
+def _root_rows(
+    plan: SubscriptionPlan, snapshots: Dict[str, _OrderedStore]
+) -> List[Tuple[Any, Dict[str, Any]]]:
+    """Current root snapshots in stable insert order with an identity key.
+
+    Keyed rows use their primary-key tuple; keyless rows use their stored
+    object identity so an UPDATE that appends another keyless snapshot is not
+    mistaken for the same root.
+    """
+    store = snapshots.get(plan.entity_table)
+    if store is None:
+        return []
+    key_fields = plan.entity_keys[plan.entity_table]
+    rows: List[Tuple[Any, Dict[str, Any]]] = [
+        (_key_tuple(key_fields, snapshot), snapshot)
+        for snapshot in store.rows.values()
+    ]
+    rows.extend((id(snapshot), snapshot) for snapshot in store.keyless)
+    return rows
+
+
+def _direct_identity(
+    plan: SubscriptionPlan,
+    snapshots: Dict[str, _OrderedStore],
+    event: Dict[str, Any],
+) -> Any:
+    """Store identity of the row a root entity event directly targets."""
+    op = event["op"]
+    snapshot = event["after"] if op in ("INSERT", "UPDATE") else event["before"]
+    key = _key_tuple(plan.entity_keys[plan.entity_table], snapshot)
+    if key is not None:
+        return key
+    if op in ("INSERT", "UPDATE"):
+        store = snapshots.get(plan.entity_table)
+        if store is not None:
+            for keyless in store.keyless:
+                if keyless is snapshot:
+                    return id(keyless)
+    return id(snapshot)
+
+
+def _push_root_event(
+    plan: SubscriptionPlan,
+    event: Dict[str, Any],
+    snapshots: Dict[str, _OrderedStore],
+    source: str,
+    lineno: int,
+) -> Optional[Dict[str, Any]]:
+    """Emit the direct record for a root entity INSERT/UPDATE/DELETE.
+
+    Returns the record, or None when the operative snapshot does not match
+    the filter. Root events keep their original behavior even when the root
+    table is also reachable through a self-referential @link.
+    """
+    op = event["op"]
+    snapshot = event["after"] if op in ("INSERT", "UPDATE") else event["before"]
+    if snapshot is None:
+        raise PlanError(
+            "EventError", f"{source}:{lineno}: {op} event has no snapshot"
+        )
+    if not plan.matches(snapshot):
+        return None
+    data = _project(
+        plan.tree.children,
+        snapshot,
+        snapshots,
+        plan.entity_keys,
+        source,
+        lineno,
+        plan.path,
+    )
+    return {
+        "subscription": plan.operation_name,
+        "path": plan.path,
+        "event": op,
+        "entity": event["entity"],
+        "data": data,
+    }
+
+
+def _push_dependency_changes(
+    plan: SubscriptionPlan,
+    snapshots: Dict[str, _OrderedStore],
+    source: str,
+    lineno: int,
+    before_shapes: Dict[Any, Any],
+    excluded: Optional[set],
+) -> List[Dict[str, Any]]:
+    """Append synthetic UPDATEs for roots whose projected shape changed.
+
+    Only roots present both before and after the event, still matching the
+    filter and not carrying their own direct record for this line qualify;
+    they are reported in the current stable root insert order.
+    """
+    outputs: List[Dict[str, Any]] = []
+    for identity, snapshot in _root_rows(plan, snapshots):
+        if excluded is not None and identity in excluded:
+            continue
+        if identity not in before_shapes or not plan.matches(snapshot):
             continue
         data = _project(
             plan.tree.children,
@@ -457,12 +601,14 @@ def push_events(
             lineno,
             plan.path,
         )
+        if before_shapes[identity] == data:
+            continue
         outputs.append(
             {
                 "subscription": plan.operation_name,
                 "path": plan.path,
-                "event": op,
-                "entity": event["entity"],
+                "event": "UPDATE",
+                "entity": plan.entity_table,
                 "data": data,
             }
         )
@@ -478,8 +624,8 @@ def _apply_event(
 
     Events for entities the subscription cannot reach are ignored. Rows whose
     snapshot lacks a usable primary key cannot identify an entity; they are
-    skipped here and surface as an EventError when a matching root event tries
-    to traverse the relationship, rather than at their own line.
+    retained separately so a list match on non-key target fields can surface
+    them as an EventError instead of silently dropping them.
     """
     key_fields = entity_keys.get(event["entity"])
     if key_fields is None:
